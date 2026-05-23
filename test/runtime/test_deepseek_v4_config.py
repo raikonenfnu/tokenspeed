@@ -1,7 +1,15 @@
 import argparse
+import os
+import sys
 import unittest
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
+
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +22,7 @@ from tokenspeed_kernel.ops.routing.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
 from tokenspeed.runtime.configs.model_config import (
@@ -623,6 +632,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(config.is_checkpoint_fp8_serialized)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @unittest.skipUnless(
+        current_platform().is_blackwell_plus,
+        "trtllm fp8_quantize_1x128 kernel layout requires sm100+",
+    )
     def test_deepseek_v4_fp8_linear_deep_gemm_pads_partial_n_block(self):
         deep_gemm_module = deepseek_v4_model.deep_gemm
         if deep_gemm_module is None:
@@ -3149,6 +3162,10 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @unittest.skipUnless(
+        current_platform().is_blackwell_plus,
+        "trtllm fp8_quantize_1x128 kernel layout requires sm100+",
+    )
     def test_deepseek_v4_fp8_activation_quant_matches_reference(self):
         x = torch.randn(5, 256, device="cuda", dtype=torch.bfloat16) * 3.0
 
@@ -3217,6 +3234,13 @@ class TestDeepseekV4Config(unittest.TestCase):
             _maybe_get_cached_w3_w1_permute_indices,
             get_w2_permute_indices_with_cache,
         )
+        from tokenspeed_kernel.registry import error_fn
+
+        if (
+            _maybe_get_cached_w3_w1_permute_indices is error_fn
+            or get_w2_permute_indices_with_cache is error_fn
+        ):
+            self.skipTest("flashinfer.fused_moe permute helpers unavailable")
 
         x = torch.empty((4096, 2048), dtype=torch.uint8)
         expected_w13 = _maybe_get_cached_w3_w1_permute_indices({}, x, 128)
