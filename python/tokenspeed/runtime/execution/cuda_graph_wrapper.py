@@ -268,6 +268,27 @@ class CudaGraphWrapper:
                     self.max_bs, self.drafter.draft_seq_lens_buf
                 )
 
+            # Drafter (Eagle) is constructed with the target's req_to_page
+            # (ModelExecutor passes the same self.req_to_page to both), and the
+            # replay path hands both backends the same req_pool_indices. The
+            # block-table gather is req_to_page[req_pool_indices] (see
+            # _create_block_kv_indices; it does not depend on seq_lens), so both
+            # backends would compute identical block_kv_indices. When the backing
+            # buffer shapes/dtypes also line up, point the draft backend at the
+            # target's buffer and skip its gather+copy in the replay path: the
+            # target's metadata prep runs first and populates the shared buffer
+            # (see init_forward_metadata_replay_cuda_graph).
+            target_kv = getattr(attn_backend, "decode_cuda_graph_kv_indices", None)
+            draft_kv = getattr(draft_attn_backend, "decode_cuda_graph_kv_indices", None)
+            if (
+                target_kv is not None
+                and draft_kv is not None
+                and target_kv.shape == draft_kv.shape
+                and target_kv.dtype == draft_kv.dtype
+            ):
+                draft_attn_backend.decode_cuda_graph_kv_indices = target_kv
+                draft_attn_backend._block_table_aliased = True
+
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.output_buffers: dict[int, tuple] = {}
 
