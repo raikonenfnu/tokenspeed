@@ -263,7 +263,13 @@ if platform.is_amd:
         ),
         traits={
             "weight_dtype": frozenset({"mxfp4"}),
-            "activation": frozenset({"silu", "swiglu"}),
+            # NOTE: this kernel always evaluates the GPT-OSS gated activation
+            # ``s * (linear + 1)`` (triton_kernels swiglu, alpha default 1.702,
+            # limit 7.0) and cannot express a plain ``silu(gate) * up`` SwiGLU
+            # (no ``+1``, alpha 1.0, no clamp). Advertising only ``swiglu`` keeps
+            # plain-silu MXFP4 MoE models (e.g. Qwen3.5) on the portable Triton
+            # apply, which uses ``_silu_gate_up``. See bringup log B9.
+            "activation": frozenset({"swiglu"}),
             "routing_mode": frozenset({"kernel_routing"}),
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({False}),
