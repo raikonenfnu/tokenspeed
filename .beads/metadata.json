@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "tokenspeed",
+  "project_id": "2c63911c-5881-4f82-8f53-442544a6802f"
+}
