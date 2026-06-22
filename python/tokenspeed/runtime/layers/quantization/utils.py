@@ -108,6 +108,26 @@ def should_ignore_quant_layer(
                     and prefix_v_proj in ignored_layers
                 ):
                     should_ignore_layer = True
+            elif "in_proj_qkvzba" in prefix:
+                # Qwen3.5 GDN fuses the linear-attn input projection into a
+                # single in_proj_qkvzba module, but checkpoints ship the shards
+                # separately (split: in_proj_qkv/z/b/a, or pre-packed:
+                # in_proj_qkvz/ba). The fused module is ignored iff every shard
+                # it is built from is ignored.
+                shard_groups = (
+                    ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),
+                    ("in_proj_qkvz", "in_proj_ba"),
+                )
+                for shards in shard_groups:
+                    shard_prefixes = [
+                        prefix.replace("in_proj_qkvzba", s) for s in shards
+                    ]
+                    if all(
+                        check_equal_or_regex_match(p, ignored_layers)
+                        for p in shard_prefixes
+                    ):
+                        should_ignore_layer = True
+                        break
             elif "experts" in prefix:
                 should_ignore_layer = any(
                     [
