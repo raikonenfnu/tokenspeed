@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -38,6 +39,9 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
+)
+from tokenspeed.runtime.layers.attention.linear.chunk import (
+    chunk_gated_delta_rule,
 )
 from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
     CHUNK_SIZE as FLA_CHUNK_SIZE,
@@ -429,10 +433,58 @@ class MambaAttnBackend(AttentionBackend):
             config, "speculative_num_draft_tokens", 0
         )
         self.pool: SimpleMambaPool = None
-        self._gdn_fastpath_checked = False
+        # GDN prefill backend selection, resolved lazily on first prefill.
+        #   None  -> not yet resolved
+        #   True  -> portable Triton chunk_gated_delta_rule (AMD / non-Blackwell)
+        #   False -> flashinfer Blackwell fast-path (NVIDIA sm100/sm103)
+        self._gdn_use_triton: bool | None = None
 
     def set_pool(self, pool: SimpleMambaPool):
         self.pool = pool
+
+    def _resolve_gdn_prefill_backend(
+        self,
+        head_k_dim: int,
+        head_v_dim: int,
+        dtype: torch.dtype,
+        num_q_heads: int,
+        num_v_heads: int,
+    ) -> bool:
+        """Decide (once) whether GDN prefill uses the portable Triton path.
+
+        The flashinfer chunked-prefill kernel is NVIDIA Blackwell only
+        (sm100/sm103 + CUDA>=13). On every other platform -- notably AMD
+        MI350/CDNA4 -- we fall back to the portable FLA-derived Triton
+        ``chunk_gated_delta_rule``. ``TOKENSPEED_GDN_FORCE_TRITON=1`` forces the
+        Triton path even on Blackwell (useful for parity testing).
+
+        Returns ``True`` to use the Triton path, ``False`` for flashinfer.
+        """
+        if self._gdn_use_triton is not None:
+            return self._gdn_use_triton
+
+        force_triton = os.environ.get("TOKENSPEED_GDN_FORCE_TRITON", "") in {
+            "1",
+            "true",
+            "True",
+        }
+        flashinfer_ok = (
+            gdn_flashinfer.is_supported(head_k_dim, dtype, num_q_heads, num_v_heads)
+            and head_v_dim == head_k_dim
+        )
+
+        if force_triton or not flashinfer_ok:
+            # The Triton chunk kernel handles arbitrary head_dim / head ratios
+            # and bf16/fp16; it only rejects float32 inputs.
+            if dtype == torch.float32:
+                raise RuntimeError(
+                    "GDN prefill (Triton chunk_gated_delta_rule) requires bf16/"
+                    f"fp16 q/k/v, got {dtype}."
+                )
+            self._gdn_use_triton = True
+        else:
+            self._gdn_use_triton = False
+        return self._gdn_use_triton
 
     def reset_current_inputs(
         self, req_pool_indices: torch.Tensor, working_indices: torch.Tensor
@@ -1102,24 +1154,40 @@ class MambaAttnBackend(AttentionBackend):
                 self.forward_metadata.track_ssm_final_src is not None
                 and self.forward_metadata.track_ssm_final_src.numel() > 0
             )
-            if not self._gdn_fastpath_checked:
-                if not (
-                    gdn_flashinfer.is_supported(
-                        head_k_dim, query.dtype, num_heads, num_value_heads
+
+            use_triton = self._resolve_gdn_prefill_backend(
+                head_k_dim, head_v_dim, query.dtype, num_heads, num_value_heads
+            )
+
+            if use_triton:
+                if need_h_track:
+                    # The prefix-cache intermediate-checkpoint extraction
+                    # (track_ssm_h) is tied to flashinfer's per-chunk checkpoint
+                    # buffer layout and is not yet implemented for the portable
+                    # Triton path. Launch with --no-enable-prefix-caching on
+                    # non-Blackwell GPUs. See qwen3.5_tokenspeed_bringup.md (B2).
+                    raise NotImplementedError(
+                        "GDN prefix-cache checkpointing is not yet wired for the "
+                        "portable Triton chunk_gated_delta_rule path used on "
+                        "non-Blackwell GPUs (e.g. AMD MI350). Relaunch with "
+                        "--no-enable-prefix-caching."
                     )
-                    and head_v_dim == head_k_dim
-                ):
-                    raise RuntimeError(
-                        "GDN prefill requires the flashinfer Blackwell fast-path "
-                        "(sm100/sm103 + CUDA 13 + bf16 + head_dim=128 + "
-                        "head_v == head_k + num_v >= num_q). Got "
-                        f"dtype={query.dtype}, head_k={head_k_dim}, "
-                        f"head_v={head_v_dim}, num_q={num_heads}, "
-                        f"num_v={num_value_heads}, "
-                        f"sm100_available={gdn_flashinfer.is_available()}."
-                    )
-                self._gdn_fastpath_checked = True
-            if need_h_track:
+                # FLA convention: q/k/v are [1, T, H, D]; g is log-space [1, T, H];
+                # beta is [1, T, H]; q/k are L2-normalised inside the kernel.
+                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    scale=head_k_dim**-0.5,
+                    initial_state=recurrent_state,
+                    output_final_state=True,
+                    cu_seqlens=query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
+            elif need_h_track:
                 core_attn_out, last_recurrent_state, fi_h_checkpoints, _ = (
                     gdn_flashinfer.gdn_chunk_prefill(
                         l2norm_fwd(query),

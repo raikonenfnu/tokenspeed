@@ -99,6 +99,15 @@ def _iter_ignored_layer_pattern_aliases(raw: str):
         yield raw.removeprefix("language_model.")
         return
 
+    # Multimodal Qwen3.5 checkpoints prefix language-model weights with
+    # ``model.language_model.`` while the runtime collapses that to ``model.``
+    # (see qwen3_5.py load_weights). Mirror that rename so exclude patterns like
+    # ``model.language_model.layers.0.linear_attn.out_proj`` match the runtime
+    # module prefix ``model.layers.0.linear_attn.out_proj``.
+    if "model.language_model." in raw:
+        yield raw.replace("model.language_model.", "model.")
+        return
+
     if raw.startswith("re:"):
         regex = raw[3:]
         for prefix in ("language_model.", re.escape("language_model.")):
