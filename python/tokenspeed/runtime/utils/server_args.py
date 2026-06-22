@@ -1280,11 +1280,14 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=["greedy", "flashinfer", "flashinfer_full"],
+            choices=["greedy", "torch", "flashinfer", "flashinfer_full"],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
             "When unspecified, defaults to 'flashinfer' on NVIDIA and 'greedy' elsewhere. "
             "'greedy': argmax + verify_chain_greedy, zero sampling-param plumbing. "
+            "'torch': vendor-neutral pure-torch temperature/top_k/top_p sampling "
+            "(no flashinfer kernels); greedy-only verify; use with enforce_eager. "
+            "Intended sampling fallback for non-NVIDIA (e.g. ROCm) serving. "
             "'flashinfer': temperature/top_k/top_p via fused softmax + top_k_top_p_sampling_from_probs; "
             "min_p and penalties silently ignored. "
             "'flashinfer_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
