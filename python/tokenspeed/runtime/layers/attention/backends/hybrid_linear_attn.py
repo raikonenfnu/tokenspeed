@@ -1084,6 +1084,27 @@ class MambaAttnBackend(AttentionBackend):
                 and self.forward_metadata.track_ssm_h_src.numel() > 0
             )
 
+            # The GDN intermediate-checkpoint (h-track) writes are only ever
+            # consumed on a later prefix-cache hit. The portable Triton
+            # chunk_gated_delta_rule path (AMD / non-Blackwell) does not produce
+            # flashinfer's per-chunk checkpoint buffer, so when it is selected we
+            # drop the intermediate checkpoint extraction. This is numerically
+            # safe: the final recurrent state is still computed and persisted
+            # below, and the mamba radix-cache track slots are only read back on
+            # prefix reuse, which this path does not support. See
+            # qwen3.5_tokenspeed_bringup.md (B2).
+            if need_h_track:
+                _key_split_dim = key_dim // attn_tp_size
+                _value_split_dim = value_dim // attn_tp_size
+                if self._resolve_gdn_prefill_backend(
+                    head_k_dim,
+                    head_v_dim,
+                    mixed_qkv.dtype,
+                    _key_split_dim // head_k_dim,
+                    _value_split_dim // head_v_dim,
+                ):
+                    need_h_track = False
+
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
             if need_h_track:
                 if self.forward_metadata.track_conv_indices is None:
