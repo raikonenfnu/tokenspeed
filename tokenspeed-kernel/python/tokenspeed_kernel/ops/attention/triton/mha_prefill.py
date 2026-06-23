@@ -170,7 +170,10 @@ def _fwd_kernel(
                     mask=mask_n,
                     other=0,
                 )
-                offs_kv_loc = physical_pages * PAGE_SIZE + page_offsets
+                # Promote to int64: for large KV caches the element offset
+                # (physical_page * page_size * stride) can exceed the int32 range
+                # and silently wrap to a negative address, yielding zero output.
+                offs_kv_loc = physical_pages.to(tl.int64) * PAGE_SIZE + page_offsets
                 offs_k = (
                     offs_kv_loc[None, :] * stride_buf_kbs
                     + cur_kv_head * stride_buf_kh

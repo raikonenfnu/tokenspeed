@@ -535,6 +535,20 @@ class ServerArgs:
             )
 
     def resolve_communication(self):
+        # Escape hatch: allow disabling the fused allreduce+RMSNorm path (which
+        # routes through the Iris symmetric-heap collective). Useful when Iris
+        # fd-passing setup deadlocks on a given platform/topology.
+        if os.environ.get("TOKENSPEED_DISABLE_ALLREDUCE_FUSION", "") in {
+            "1",
+            "true",
+            "True",
+        }:
+            self.enable_allreduce_fusion = False
+            logger.info(
+                "Allreduce fusion disabled via TOKENSPEED_DISABLE_ALLREDUCE_FUSION"
+            )
+            return
+
         # Auto-enable allreduce fusion on supported single-node TP configurations.
         platform = current_platform()
         if (
