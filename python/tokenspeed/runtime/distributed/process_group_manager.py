@@ -22,6 +22,7 @@
 
 from datetime import timedelta
 
+import torch
 import torch.distributed as dist
 
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
@@ -52,6 +53,7 @@ class ProcessGroupManager:
         distributed_init_method: str = "env://",
         backend: str = "nccl",
         timeout: int | None = None,
+        device_id: "torch.device | None" = None,
     ) -> None:
         if not dist.is_initialized():
             assert (
@@ -62,12 +64,18 @@ class ProcessGroupManager:
                 assert timeout > 0, "timeout must be positive"
                 timeout = timedelta(seconds=timeout)
 
+            # Bind the default process group to this rank's GPU explicitly.
+            # Without device_id, NCCL "guesses" the device from the global
+            # rank; when that guess is wrong/ambiguous (e.g. single-node TP=8
+            # rank->GPU layouts) collectives such as all_gather_object — used
+            # by Iris symmetric-heap fd exchange — deadlock on first use.
             dist.init_process_group(
                 backend=backend,
                 init_method=distributed_init_method,
                 world_size=mapping.world_size,
                 rank=mapping.rank,
                 timeout=timeout,
+                device_id=device_id,
             )
 
     def register_process_group(
