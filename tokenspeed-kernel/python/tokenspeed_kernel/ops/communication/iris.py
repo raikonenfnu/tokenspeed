@@ -640,6 +640,17 @@ class IrisAllReduceResidualRMSNorm(object):
             EPS=eps,
             num_warps=8,
         )
+        # Trailing barrier closes a read-after-write hazard on the shared
+        # symmetric-heap ``_input_buf``: the leading ``device_barrier`` above
+        # only guarantees every rank finished its ``copy_`` before peers read,
+        # not that every rank finished *reading* peers' buffers before the
+        # next ``fused`` call overwrites ``_input_buf`` via ``copy_``. Without
+        # this, a rank whose CPU has raced ahead (e.g. under the overlap
+        # scheduler, which lets per-rank launch order diverge) can clobber
+        # ``_input_buf`` while a peer's previous kernel is still issuing
+        # ``iris.load`` against it, corrupting the all-reduce. The non-overlap
+        # scheduler happened to keep ranks lock-stepped enough to hide it.
+        self._ctx.device_barrier()
         return norm_out, residual_out
 
 
