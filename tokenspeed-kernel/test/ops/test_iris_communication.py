@@ -418,3 +418,146 @@ def test_iris_allreduce_residual_rmsnorm_world4(persistent: bool):
 @pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
 def test_iris_allreduce_residual_rmsnorm_world8(persistent: bool):
     _run_arrms_test(world_size=8, persistent=persistent)
+
+
+# ---------------------------------------------------------------------------
+# Suite 4: fused AR+RMSNorm buffer-reuse race regression (issue #1)
+#
+# The fused op reuses one persistent symmetric-heap buffer (``_input_buf``)
+# across calls, guarded only by a *leading* ``device_barrier`` (all ranks
+# wrote before any peer reads). Without a *trailing* barrier, the next call's
+# ``copy_`` can overwrite ``_input_buf`` while a peer rank's previous kernel is
+# still ``iris.load``-ing it -> cross-rank corrupted all-reduce.
+#
+# Suite 3 cannot catch this: it issues one call per size with a *uniform*
+# per-rank input, so a clobber by a (nonexistent) next call would be invisible.
+# This suite issues many back-to-back calls with *distinct random* data per
+# call and injects per-rank CPU skew (what the overlap scheduler creates in
+# production), then checks every call against an independent NCCL all-reduce
+# reference. Pre-fix: nonzero mismatches (intermittent). Post-fix: zero.
+# ---------------------------------------------------------------------------
+
+
+_RACE_CALLS = 2000
+_RACE_TOKENS = 2048
+_RACE_HIDDEN = 2880
+_RACE_EPS = 1e-6
+_RACE_TOL = 5e-2
+
+
+def _race_worker_fn(rank, world_size, port, error_dict):
+    try:
+        _race_worker_main(rank, world_size, port)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+
+
+def _race_pattern(base: torch.Tensor, call_idx: int) -> torch.Tensor:
+    # Per-call NON-uniform pattern, IDENTICAL across ranks (so the reference is
+    # local/analytic: sum = world_size * pattern). It varies across the hidden
+    # dim *and* per call, so RMSNorm preserves it and a clobber that swaps in a
+    # neighbouring call's pattern changes the normalized output detectably.
+    return torch.sin(base + 0.5 * call_idx).to(torch.bfloat16)
+
+
+def _race_worker_main(rank: int, world_size: int, port: int) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+
+    try:
+        from tokenspeed_kernel.ops.communication.iris import (
+            create_iris_ar_rmsnorm_state,
+            iris_allreduce_residual_rmsnorm,
+        )
+
+        state = create_iris_ar_rmsnorm_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            max_token_num=_RACE_TOKENS,
+            hidden_dim=_RACE_HIDDEN,
+            dtype=torch.bfloat16,
+        )
+        weight = torch.linspace(
+            0.5, 1.5, _RACE_HIDDEN, dtype=torch.bfloat16, device=device
+        )
+        residual = torch.zeros(
+            _RACE_TOKENS, _RACE_HIDDEN, dtype=torch.bfloat16, device=device
+        )
+        base = (
+            torch.arange(
+                _RACE_TOKENS * _RACE_HIDDEN, device=device, dtype=torch.float32
+            )
+            .remainder_(257)
+            .mul_(0.02)
+            .reshape(_RACE_TOKENS, _RACE_HIDDEN)
+        )
+        scratch = torch.empty((1 << 20,), dtype=torch.float32, device=device)
+
+        # GPU-side mismatch counter: never .item() inside the loop, so no rank
+        # ever host-syncs / resyncs mid-stream — divergence (the hazard) is
+        # preserved. The only cross-rank sync in the loop is the op's own
+        # leading device_barrier.
+        mism = torch.zeros((), dtype=torch.float32, device=device)
+
+        for c in range(_RACE_CALLS):
+            x = _race_pattern(base, c)
+
+            # Asymmetric skew so ranks fan out in launch time the way the
+            # overlap scheduler's per-rank (e.g. MoE) imbalance does.
+            for _ in range((rank + 1) * 24):
+                scratch.sin_()
+
+            norm_out, _ = iris_allreduce_residual_rmsnorm(
+                state,
+                input_tensor=x,
+                residual=residual,
+                weight=weight,
+                eps=_RACE_EPS,
+            )
+
+            reduced = (world_size * x.float()) + residual.float()
+            ref_norm = reduced * torch.rsqrt(
+                reduced.pow(2).mean(dim=-1, keepdim=True) + _RACE_EPS
+            )
+            ref_norm = ref_norm * weight.float()
+
+            max_err = (norm_out.float() - ref_norm).abs().amax()
+            mism += (max_err > _RACE_TOL).to(torch.float32)
+
+        dist.all_reduce(mism, op=dist.ReduceOp.SUM)
+        bad = int(mism.item())
+        assert bad == 0, (
+            f"{bad} corrupted fused calls across ranks: Iris fused AR+RMSNorm "
+            "reused its symmetric-heap _input_buf before all peers finished "
+            "reading it (missing trailing device_barrier)."
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_race_test(world_size: int) -> None:
+    _skip_if_unsupported(world_size, "Iris fused AR+RMSNorm reuse-race regression")
+    port = _get_open_port()
+    _spawn_and_collect(_race_worker_fn, (world_size, port), world_size)
+
+
+def test_iris_arrms_reuse_race_world4():
+    # Correctness-under-skew coverage on 4-GPU boxes. Passes with the fix; the
+    # missing-barrier window is narrow at TP=4 so this does not reliably fail
+    # pre-fix -- ``world8`` below is the deterministic regression discriminator.
+    _run_race_test(world_size=4)
+
+
+def test_iris_arrms_reuse_race_world8():
+    # Regression discriminator: with 8 ranks contending for the single shared
+    # ``_input_buf``, removing the trailing ``device_barrier`` reliably
+    # corrupts at least one of the back-to-back fused calls (verified), while
+    # the fixed code passes.
+    _run_race_test(world_size=8)
