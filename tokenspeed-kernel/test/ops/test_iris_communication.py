@@ -418,3 +418,108 @@ def test_iris_allreduce_residual_rmsnorm_world4(persistent: bool):
 @pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
 def test_iris_allreduce_residual_rmsnorm_world8(persistent: bool):
     _run_arrms_test(world_size=8, persistent=persistent)
+
+
+# ---------------------------------------------------------------------------
+# Suite 4: fused AR+RMSNorm buffer-reuse race (issue #1 regression)
+#
+# The op reuses ONE persistent symmetric-heap buffer (``_input_buf``) across
+# calls, guarded only by a *leading* ``device_barrier``. Without a *trailing*
+# barrier, a fast rank's NEXT ``copy_`` can overwrite ``_input_buf`` while a
+# slow peer's PREVIOUS kernel is still ``iris.load``-ing it -> the all-reduce
+# sums a neighbouring call's data.
+#
+# We make that directly visible: on call ``c`` every rank contributes the
+# integer tag ``c % _TAG_MOD + 1`` with a zero residual, so the correct
+# all-reduce (``residual_out``) is *exactly* ``world_size * tag`` -- an exact
+# bf16 integer. If a peer's buffer is clobbered mid-read, the sum instead picks
+# up the neighbouring call's tag and the exact compare fails. Per-rank CPU skew
+# opens the window the way the overlap scheduler's launch divergence does.
+# ---------------------------------------------------------------------------
+
+_RACE_CALLS = 1500
+_RACE_TOKENS = 2048
+_RACE_HIDDEN = 2880
+_TAG_MOD = 16  # tags 1..16; world_size * tag <= 128, exact in bf16
+
+
+def _race_worker_fn(rank, world_size, port, error_dict):
+    try:
+        _race_worker_main(rank, world_size, port)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+
+
+def _race_worker_main(rank: int, world_size: int, port: int) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        from tokenspeed_kernel.ops.communication.iris import (
+            create_iris_ar_rmsnorm_state,
+            iris_allreduce_residual_rmsnorm,
+        )
+
+        state = create_iris_ar_rmsnorm_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            max_token_num=_RACE_TOKENS,
+            hidden_dim=_RACE_HIDDEN,
+            dtype=torch.bfloat16,
+        )
+        weight = torch.ones(_RACE_HIDDEN, dtype=torch.bfloat16, device=device)
+        residual = torch.zeros(
+            _RACE_TOKENS, _RACE_HIDDEN, dtype=torch.bfloat16, device=device
+        )
+        scratch = torch.empty((1 << 20,), dtype=torch.float32, device=device)
+        # On-GPU mismatch counter: never ``.item()`` inside the loop, so no rank
+        # host-syncs and the per-rank divergence (the hazard) is preserved.
+        bad = torch.zeros((), dtype=torch.float32, device=device)
+
+        for c in range(_RACE_CALLS):
+            tag = float(c % _TAG_MOD + 1)
+            x = torch.full(
+                (_RACE_TOKENS, _RACE_HIDDEN), tag, dtype=torch.bfloat16, device=device
+            )
+            # Asymmetric skew: higher ranks lag, so rank 0 races into the next
+            # call's copy_ while laggards still read the current buffer.
+            for _ in range((rank + 1) * 24):
+                scratch.sin_()
+
+            _, residual_out = iris_allreduce_residual_rmsnorm(
+                state,
+                input_tensor=x,
+                residual=residual,
+                weight=weight,
+                eps=1e-6,
+            )
+
+            # Correct sum is exactly world_size * tag everywhere. Anything else
+            # means a peer's _input_buf was overwritten mid-read.
+            bad += (residual_out.float() != world_size * tag).any().to(torch.float32)
+
+        dist.all_reduce(bad, op=dist.ReduceOp.SUM)
+        assert int(bad.item()) == 0, (
+            f"{int(bad.item())} corrupted calls: Iris fused AR+RMSNorm reused "
+            "its symmetric-heap _input_buf before all peers finished reading it "
+            "(missing trailing device_barrier)."
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_race_test(world_size: int) -> None:
+    _skip_if_unsupported(world_size, "Iris fused AR+RMSNorm buffer-reuse race")
+    port = _get_open_port()
+    _spawn_and_collect(_race_worker_fn, (world_size, port), world_size)
+
+
+def test_iris_arrms_buffer_reuse_race_world8():
+    # world8 maximises contention for the single shared buffer and is the
+    # deterministic discriminator: it corrupts pre-fix and passes post-fix.
+    _run_race_test(world_size=8)
