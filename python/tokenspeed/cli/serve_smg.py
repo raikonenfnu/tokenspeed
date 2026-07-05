@@ -66,6 +66,7 @@ DEFAULT_SMG_POLICY = "passthrough"
 _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-circuit-breaker",
     "--disable-retries",
+    "--disable-health-check",
 )
 
 
