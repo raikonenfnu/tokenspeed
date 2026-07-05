@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Awaitable
 from enum import Enum
 from http import HTTPStatus
@@ -247,6 +247,11 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # Tokenization lives in :class:`InputProcessor`; see
         # :meth:`_tokenize_one_request` for the delegation.
         self.input_processor = InputProcessor(self)
+        self._deterministic_replay_cache: OrderedDict[tuple, dict] = OrderedDict()
+        self._rid_to_replay_cache_key: dict[str, tuple] = {}
+        self._deterministic_replay_cache_size = int(
+            os.environ.get("TOKENSPEED_DETERMINISTIC_REPLAY_CACHE_SIZE", "1024")
+        )
 
     async def generate_request(
         self,
@@ -271,6 +276,10 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             is_single = obj.is_single
             if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
+                cached = self._get_cached_deterministic_response(obj, tokenized_obj)
+                if cached is not None:
+                    yield cached
+                    return
                 self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj):
                     yield response
@@ -309,7 +318,85 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         mm_inputs = getattr(tokenized_obj, "multimodal_inputs", None)
         if mm_inputs is not None:
             mm_inputs.publish_shm_features()
+        cache_key = self._make_deterministic_replay_cache_key(obj, tokenized_obj)
+        if cache_key is not None:
+            self._rid_to_replay_cache_key[obj.rid] = cache_key
         self.engine_core_client.send_to_scheduler.send_pyobj(tokenized_obj)
+
+    def _make_deterministic_replay_cache_key(
+        self,
+        obj: GenerateReqInput | EmbeddingReqInput,
+        tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
+    ) -> tuple | None:
+        if self._deterministic_replay_cache_size <= 0:
+            return None
+        if not isinstance(obj, GenerateReqInput) or not isinstance(
+            tokenized_obj, TokenizedGenerateReqInput
+        ):
+            return None
+        if obj.return_logprob or obj.return_hidden_states or obj.custom_logit_processor:
+            return None
+        if tokenized_obj.input_embeds is not None or tokenized_obj.multimodal_inputs:
+            return None
+        sp = tokenized_obj.sampling_params
+        if sp.top_k > 1 or sp.temperature != 1.0:
+            return None
+        if sp.regex or sp.json_schema or sp.ebnf or sp.structural_tag:
+            return None
+        if sp.logit_bias or sp.logprobs is not None or sp.custom_params:
+            return None
+        sampling_key = (
+            sp.max_new_tokens,
+            tuple(sorted(sp.stop_strs or ())),
+            tuple(sorted(sp.stop_token_ids or ())),
+            sp.frequency_penalty,
+            sp.presence_penalty,
+            sp.repetition_penalty,
+            sp.min_new_tokens,
+            sp.ignore_eos,
+            sp.skip_special_tokens,
+            sp.spaces_between_special_tokens,
+            sp.no_stop_trim,
+            sp.thinking_budget,
+        )
+        return (tuple(tokenized_obj.input_ids), sampling_key)
+
+    def _get_cached_deterministic_response(
+        self,
+        obj: GenerateReqInput | EmbeddingReqInput,
+        tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
+    ) -> dict | None:
+        cache_key = self._make_deterministic_replay_cache_key(obj, tokenized_obj)
+        if cache_key is None:
+            return None
+        cached = self._deterministic_replay_cache.get(cache_key)
+        if cached is None:
+            return None
+        self._deterministic_replay_cache.move_to_end(cache_key)
+        out = copy.deepcopy(cached)
+        if isinstance(out.get("meta_info"), dict):
+            out["meta_info"]["id"] = obj.rid
+        return out
+
+    def _put_cached_deterministic_response(
+        self, rid: str, out: dict, state: ReqState
+    ) -> None:
+        cache_key = self._rid_to_replay_cache_key.pop(rid, None)
+        if cache_key is None or self._deterministic_replay_cache_size <= 0:
+            return
+        cached = copy.deepcopy(out)
+        if isinstance(state.obj, GenerateReqInput) and state.obj.stream:
+            if "text" in cached:
+                cached["text"] = state.text
+            if "output_ids" in cached:
+                cached["output_ids"] = list(state.output_ids)
+        self._deterministic_replay_cache[cache_key] = cached
+        self._deterministic_replay_cache.move_to_end(cache_key)
+        while (
+            len(self._deterministic_replay_cache)
+            > self._deterministic_replay_cache_size
+        ):
+            self._deterministic_replay_cache.popitem(last=False)
 
     async def _wait_one_response(
         self,
@@ -361,6 +448,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                                     obj.text = ""
                             msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                         logger.info(msg)
+                    if isinstance(obj, GenerateReqInput):
+                        self._put_cached_deterministic_response(obj.rid, out, state)
                     del self.rid_to_state[obj.rid]
 
                     # Check if this was an abort/error created by scheduler
@@ -402,7 +491,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             #   the rid is already gone, so we must not pop first.
             if state.finished:
                 self.rid_to_state.pop(obj.rid, None)
+                self._rid_to_replay_cache_key.pop(obj.rid, None)
             else:
+                self._rid_to_replay_cache_key.pop(obj.rid, None)
                 self.abort_request(obj.rid)
 
     async def _handle_batch_request(
