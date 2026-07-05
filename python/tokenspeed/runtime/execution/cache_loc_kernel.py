@@ -400,14 +400,17 @@ def update_block_table(forward_op, device, req_to_page):
         return
 
     max_pages = req_to_page.shape[1]
+    # Hybrid prefix cache can replace earlier logical pages with tree-owned
+    # prefix pages while also appending a new decode page. Treat the scheduler's
+    # occupied_pages row as authoritative instead of applying only the append
+    # delta; otherwise stale Python block-table entries can alias newly reused
+    # pages at page boundaries.
+    begins = [0 for _ in forward_op.begins]
+    new_occupied_pages = [list(row) for row in forward_op.occupied_pages]
+    sizes = [len(row) for row in new_occupied_pages]
     # Clamp a request that would overflow req_to_page instead of crashing the
     # engine. Happens when MTP accept-rate collapse keeps a request alive past
     # context_len; its KV drops but it will be finished shortly.
-    sizes = list(forward_op.sizes)
-    begins = list(forward_op.begins)
-    # new_occupied_pages is a list-of-lists [batch, size_i] of page ids;
-    # take a shallow copy so we can trim the offending request's row.
-    new_occupied_pages = [list(row) for row in forward_op.new_occupied_pages]
     request_ids = list(forward_op.request_ids)
     for i, (begin, size) in enumerate(zip(begins, sizes)):
         if begin + size > max_pages:
