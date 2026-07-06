@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.triton.fla.chunk import chunk_gated_delta_rule
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -60,12 +61,6 @@ def triton_gdn_chunk_prefill(
 ) -> (
     tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ):
-    # Temporary bridge while the FLA-derived GDN Triton kernels are migrated
-    # from runtime into tokenspeed-kernel proper.
-    from tokenspeed.runtime.layers.attention.linear.chunk import (
-        chunk_gated_delta_rule,
-    )
-
     return chunk_gated_delta_rule(
         q=q,
         k=k,
