@@ -20,3 +20,4 @@
 
 import tokenspeed_kernel.ops.moe.triton.fp8  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton.mxfp4  # noqa: F401
+import tokenspeed_kernel.ops.moe.triton.unquant  # noqa: F401
