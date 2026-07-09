@@ -410,13 +410,18 @@ def _trait_value_matches(spec_values: frozenset[Any], trait_value: Any) -> bool:
 
 
 def _ispp_satisfies_alignment(spec: KernelSpec, ispp: Any) -> bool:
+    excluded_ispps = spec.traits.get("excluded_ispp")
     alignments = spec.traits.get("ispp_alignment")
-    if alignments is None:
-        return True
     try:
         ispp_value = int(ispp)
     except (TypeError, ValueError):
         return False
+    if excluded_ispps is not None and any(
+        ispp_value == int(excluded_ispp) for excluded_ispp in excluded_ispps
+    ):
+        return False
+    if alignments is None:
+        return True
     return any(
         int(alignment) > 0 and ispp_value % int(alignment) == 0
         for alignment in alignments

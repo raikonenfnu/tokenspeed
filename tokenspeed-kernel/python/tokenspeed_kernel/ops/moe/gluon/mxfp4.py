@@ -81,6 +81,7 @@ if platform.is_amd:
             "supports_ep": frozenset({False}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({1}),
+            "excluded_ispp": frozenset({256}),
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({True}),
         },
