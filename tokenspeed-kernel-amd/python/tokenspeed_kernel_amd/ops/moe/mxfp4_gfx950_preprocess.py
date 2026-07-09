@@ -201,6 +201,31 @@ def _attach_w2_logical_n(w: torch.nn.Module) -> None:
         wrapped.original_n = int(logical_n)
 
 
+def _pad_dynamic_w2_k_if_needed(w: torch.nn.Module) -> None:
+    """Pad dynamic-MXFP4 combine K=256 to the next safe Gluon layout."""
+    logical_k = int(w.w2_weight.shape[-1]) * 2
+    if logical_k != 256:
+        return
+
+    target_k = 512
+    extra_weight_bytes = (target_k - logical_k) // 2
+    extra_scale_cols = (target_k - logical_k) // _MXFP_BLOCK_SIZE
+
+    w2_weight = torch.nn.Parameter(
+        torch.nn.functional.pad(w.w2_weight.data, (0, extra_weight_bytes)),
+        requires_grad=False,
+    )
+    w2_weight_scale = torch.nn.Parameter(
+        torch.nn.functional.pad(w.w2_weight_scale.data, (0, extra_scale_cols)),
+        requires_grad=False,
+    )
+    _release_parameter(w, "w2_weight")
+    _release_parameter(w, "w2_weight_scale")
+    w.register_parameter("w2_weight", w2_weight)
+    w.register_parameter("w2_weight_scale", w2_weight_scale)
+    w._w2_logical_k = logical_k
+
+
 def preprocess_gluon_mxfp4_gfx950_moe_weights(
     plan: dict,
     w: torch.nn.Module,
@@ -208,6 +233,13 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
     preshuffle: bool = True,
 ) -> None:
     _pad_w2_to_block_n(w, _GLUON_COMBINE_BLOCK_N)
+
+    quant_config = getattr(w, "quant_config", None)
+    use_dynamic_mxfp4_activations = bool(
+        getattr(quant_config, "use_dynamic_mxfp4_activations", False)
+    )
+    if use_dynamic_mxfp4_activations:
+        _pad_dynamic_w2_k_if_needed(w)
 
     w13_layout = getattr(w, "w13_input_layout", "concatenated")
     if w13_layout not in {"interleaved", "concatenated"}:
@@ -244,10 +276,6 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
         w.w2_weight, w.w2_weight_scale, num_warps
     )
 
-    quant_config = getattr(w, "quant_config", None)
-    use_dynamic_mxfp4_activations = bool(
-        getattr(quant_config, "use_dynamic_mxfp4_activations", False)
-    )
     has_static_fp8_scales = (
         hasattr(w, "w13_input_scale")
         and hasattr(w, "w2_input_scale")

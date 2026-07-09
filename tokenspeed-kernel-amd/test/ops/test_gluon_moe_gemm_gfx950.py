@@ -1159,7 +1159,10 @@ def test_dynamic_route_without_topk_normalization_uses_full_softmax_gfx950() -> 
     )
 
 
-def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> None:
+@pytest.mark.parametrize("intermediate_size", [256, 512])
+def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950(
+    intermediate_size: int,
+) -> None:
     from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
         _quantize_mxfp4_activation,
     )
@@ -1167,7 +1170,7 @@ def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> Non
     torch.manual_seed(20260630)
     device = "cuda"
     generator = torch.Generator(device=device).manual_seed(20260631)
-    m, e, h, i, topk = 4, 8, 512, 512, 2
+    m, e, h, i, topk = 4, 8, 512, intermediate_size, 2
     n_group, topk_group = 2, 1
     hidden = (
         torch.randn((m, h), device=device, dtype=torch.bfloat16) * 0.1

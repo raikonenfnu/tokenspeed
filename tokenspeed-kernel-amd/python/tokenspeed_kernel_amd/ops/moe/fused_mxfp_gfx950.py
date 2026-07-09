@@ -7376,6 +7376,11 @@ def gluon_mxfp_dynamic_mxfp4_fused_moe(
         fused_activation=act,
         x_scale_ragged_padded=True,
     )
+    w2_k = int(w2_weight.shape[-2]) * 2
+    if intermediate_cache.shape[-1] < w2_k:
+        intermediate_cache = torch.nn.functional.pad(
+            intermediate_cache, (0, w2_k - intermediate_cache.shape[-1])
+        )
 
     gemm2_input, gemm2_scale = _quantize_mxfp4_activation(
         intermediate_cache,
