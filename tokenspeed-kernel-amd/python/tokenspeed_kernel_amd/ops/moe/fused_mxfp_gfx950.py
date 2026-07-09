@@ -2393,6 +2393,28 @@ class MoESliceNProgram:
         return accumulator
 
     @gluon.jit
+    def _single_tile(self, loop_k):
+        cfg = self.cfg
+        SUBTILE_N: gl.constexpr = cfg.BLOCK_N // 2
+
+        load_idx = 0
+        load_idx = self.issue_global_loads(load_idx, USE_MASK=0 if cfg.EVEN_K else 1)
+        gl.amd.cdna4.async_copy.wait_group(0)
+
+        c0 = gl.zeros((cfg.BLOCK_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
+        c1 = gl.zeros((cfg.BLOCK_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
+
+        w00, sw00 = self.issue_local_load_w_sub(0, 0)
+        x0, sx0 = self.issue_local_load_x(0)
+        c0 = self.mfma(x0, sx0, w00, sw00, c0)
+
+        if self.bottom_valid:
+            w01, sw01 = self.issue_local_load_w_sub(0, 1)
+            c1 = self.mfma(x0, sx0, w01, sw01, c1)
+
+        return self._finish_accumulator(c0, c1)
+
+    @gluon.jit
     def _pipeline_top_only(self, loop_k):
         cfg = self.cfg
         NB: gl.constexpr = cfg.NUM_BUFFERS
@@ -2580,6 +2602,8 @@ class MoESliceNProgram:
             "current SliceN local-prefetch pipeline requires exactly two LDS buffers",
         )
 
+        if cfg.K_ITERS == 1:
+            return self._single_tile(loop_k)
         if self.bottom_valid:
             return self._pipeline_full(loop_k)
         return self._pipeline_top_only(loop_k)
@@ -3260,6 +3284,8 @@ def _run_moe_tile_w_via_vgpr(
         pgm = MoEPipelinedProgram.initialize(
             cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
         )
+        if cfg.K_ITERS == 1:
+            return pgm.decode_pipeline(K)
         if USE_WARP_PIPELINE:
             return pgm.warp_pipeline(K)
         return pgm.pipeline(K)
@@ -3418,6 +3444,8 @@ def _run_moe_tile_preshuffled_lds_w(
     pgm = MoEPipelinedProgram.initialize(
         cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
     )
+    if cfg.K_ITERS == 1:
+        return pgm.decode_pipeline(K)
     if USE_WARP_PIPELINE:
         return pgm.warp_pipeline(K)
     return pgm.pipeline(K)
@@ -3567,6 +3595,8 @@ def _run_moe_tile_transposed_w(
     pgm = MoEPipelinedProgram.initialize(
         cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
     )
+    if cfg.K_ITERS == 1:
+        return pgm.decode_pipeline(K)
     if USE_WARP_PIPELINE:
         return pgm.warp_pipeline(K)
     return pgm.pipeline(K)
@@ -3716,6 +3746,8 @@ def _run_moe_tile_ncontig_w(
     pgm = MoEPipelinedProgram.initialize(
         cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
     )
+    if cfg.K_ITERS == 1:
+        return pgm.decode_pipeline(K)
     if USE_WARP_PIPELINE:
         return pgm.warp_pipeline(K)
     return pgm.pipeline(K)

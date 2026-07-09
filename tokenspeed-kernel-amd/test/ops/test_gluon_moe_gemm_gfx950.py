@@ -1159,7 +1159,10 @@ def test_dynamic_route_without_topk_normalization_uses_full_softmax_gfx950() -> 
     )
 
 
-def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> None:
+@pytest.mark.parametrize("intermediate_size", [256, 512])
+def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950(
+    intermediate_size: int,
+) -> None:
     from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
         _quantize_mxfp4_activation,
     )
@@ -1167,7 +1170,7 @@ def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> Non
     torch.manual_seed(20260630)
     device = "cuda"
     generator = torch.Generator(device=device).manual_seed(20260631)
-    m, e, h, i, topk = 4, 8, 512, 512, 2
+    m, e, h, i, topk = 4, 8, 512, intermediate_size, 2
     n_group, topk_group = 2, 1
     hidden = (
         torch.randn((m, h), device=device, dtype=torch.bfloat16) * 0.1
@@ -1279,6 +1282,74 @@ def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> Non
         atol=3e-3,
         rtol=3e-2,
     )
+
+
+def test_gluon_dynamic_mxfp4_qwen35_tp4_shape_launches_gfx950() -> None:
+    torch.manual_seed(20260709)
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(20260710)
+    m, e, h, i, topk = 1, 512, 4096, 256, 10
+    n_group, topk_group = 8, 4
+
+    hidden = (
+        torch.randn((m, h), device=device, dtype=torch.bfloat16) * 0.03
+    ).contiguous()
+    logits = torch.randn((m, e), device=device, dtype=torch.bfloat16)
+    correction_bias = torch.zeros((e,), device=device, dtype=torch.float32)
+
+    def quant_weight(
+        shape: tuple[int, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _make_random_mxfp4_quantized_tensor(
+            shape,
+            device=device,
+            generator=generator,
+        )
+
+    w13_quant, w13_scale = quant_weight((e, 2 * i, h))
+    w2_quant, w2_scale = quant_weight((e, h, i))
+
+    layer = torch.nn.Module()
+    layer.quant_config = type("QuantConfig", (), {})()
+    layer.quant_config.use_dynamic_mxfp4_activations = True
+    layer.w13_input_layout = "concatenated"
+    layer.w13_weight = torch.nn.Parameter(w13_quant.clone(), requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(w13_scale.clone(), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2_quant.clone(), requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(w2_scale.clone(), requires_grad=False)
+    layer.w13_weight_bias = torch.nn.Parameter(
+        torch.zeros(e, 2 * i, device=device), requires_grad=False
+    )
+    layer.w2_weight_bias = torch.nn.Parameter(
+        torch.zeros(e, h, device=device), requires_grad=False
+    )
+    preprocess_gluon_mxfp4_gfx950_moe_weights(
+        {"internal_activation_dtype": "input"}, layer, preshuffle=True
+    )
+
+    out = gluon_mxfp_dynamic_mxfp4_fused_moe(
+        hidden,
+        logits,
+        layer.w13_weight_triton_tensor,
+        layer.w2_weight_triton_tensor,
+        w13_mx_scale=layer.w13_precision_config.b_mx_scale,
+        w2_mx_scale=layer.w2_precision_config.b_mx_scale,
+        top_k=topk,
+        correction_bias=correction_bias,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=1.0,
+        normalize_topk_weights=True,
+        w13_bias=layer.w13_weight_bias,
+        w2_bias=layer.w2_weight_bias,
+        swiglu_alpha=1.0,
+        swiglu_limit=0.0,
+        swiglu_beta=0.0,
+    )
+
+    torch.cuda.synchronize()
+    assert out.shape == (m, h)
+    assert torch.isfinite(out).all()
 
 
 def test_gluon_mxfp4_dispatch_handles_large_expert_offsets_gfx950() -> None:
