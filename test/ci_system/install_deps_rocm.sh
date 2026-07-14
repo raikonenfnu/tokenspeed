@@ -5,10 +5,11 @@ set -e
 # ROCm/AMD MI355 install script for TokenSpeed CI.
 # ============================================================
 GFX_ARCH=${GFX_ARCH:-gfx950}
-ROCM_VERSION=${ROCM_VERSION:-7.2}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
+ROCM_WHL_INDEX=${ROCM_WHL_INDEX:-https://rocm.nightlies.amd.com/whl-multi-arch/}
+ROCM_TORCH_DEVICE_WHEEL=${ROCM_TORCH_DEVICE_WHEEL:-https://rocm.nightlies.amd.com/whl-multi-arch/amd_torch_device_gfx1250-2.11.0%2Brocm7.15.0a20260626-cp312-cp312-linux_x86_64.whl}
 
-ROCM_INDEX="https://download.pytorch.org/whl/rocm${ROCM_VERSION}"
+ROCM_INDEX="${ROCM_WHL_INDEX}"
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
 WORKSPACE=${WORKSPACE:-$(pwd)}
@@ -34,7 +35,8 @@ pip_install_with_retry() {
 
 echo "=========================================="
 echo "GFX_ARCH=${GFX_ARCH}"
-echo "ROCM_VERSION=${ROCM_VERSION}"
+echo "ROCM_INDEX=${ROCM_INDEX}"
+echo "ROCM_TORCH_DEVICE_WHEEL=${ROCM_TORCH_DEVICE_WHEEL}"
 echo "WORKSPACE=${WORKSPACE}"
 echo "=========================================="
 
@@ -52,6 +54,10 @@ cd "${WORKSPACE}"
 # satisfied even before the public wheel exists.
 pip3 install --force-reinstall --no-deps \
     "${WORKSPACE}/tokenspeed-kernel-amd" --no-build-isolation
+
+pip_install_with_retry pip3 install --force-reinstall \
+    "${ROCM_TORCH_DEVICE_WHEEL}" \
+    --extra-index-url "${ROCM_INDEX}"
 
 cd "${WORKSPACE}"
 export PIP_EXTRA_INDEX_URL="${ROCM_INDEX}"

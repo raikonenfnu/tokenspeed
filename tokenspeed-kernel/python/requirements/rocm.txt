@@ -1,4 +1,4 @@
 -r common.txt
 tokenspeed-kernel-amd==0.1.1
---extra-index-url https://download.pytorch.org/whl/rocm7.2
-torch==2.11.0+rocm7.2
+--extra-index-url https://rocm.nightlies.amd.com/whl-multi-arch/
+https://rocm.nightlies.amd.com/whl-multi-arch/amd_torch_device_gfx1250-2.11.0%2Brocm7.15.0a20260626-cp312-cp312-linux_x86_64.whl
