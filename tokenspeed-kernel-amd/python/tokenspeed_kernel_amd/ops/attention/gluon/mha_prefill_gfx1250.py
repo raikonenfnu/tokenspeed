@@ -52,6 +52,7 @@ class AttentionConfig:
     SM_SCALE: gl.constexpr
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
+    MAX_Q_BLOCKS: gl.constexpr
     NUM_BUFFERS: gl.constexpr
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
@@ -78,6 +79,7 @@ class AttentionConfig:
         SM_SCALE,
         BLOCK_M,
         BLOCK_N,
+        MAX_Q_BLOCKS,
         NUM_BUFFERS,
         HAS_SINK,
         HAS_LSE,
@@ -110,6 +112,7 @@ class AttentionConfig:
         self.SM_SCALE = gl.constexpr(SM_SCALE)
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
+        self.MAX_Q_BLOCKS = gl.constexpr(MAX_Q_BLOCKS)
         self.NUM_BUFFERS = gl.constexpr(NUM_BUFFERS)
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
@@ -202,10 +205,19 @@ class AttentionProgram:
         self.v_buffer = v_buffer
 
     @gluon.jit
-    def create(cfg, q_ptr, k_ptr, v_ptr, output_ptr, sink_ptr, lse_ptr, cu_seqlens_ptr):
-        batch = gl.program_id(0)
-        q_head = gl.program_id(1)
-        q_block = gl.program_id(2)
+    def create(
+        cfg,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        output_ptr,
+        sink_ptr,
+        lse_ptr,
+        cu_seqlens_ptr,
+        batch,
+        q_head,
+        q_block,
+    ):
         kv_head = q_head // (cfg.N_HEADS // cfg.N_KV_HEADS)
         seq_base = gl.load(cu_seqlens_ptr + batch)
         seq_end = gl.load(cu_seqlens_ptr + batch + 1)
@@ -494,6 +506,12 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
     cfg = program.cfg
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
+    if cfg.WINDOW_LEFT < 0:
+        n_unmasked = (program.q_start - kv_start) // cfg.BLOCK_N
+        n_unmasked = gl.where(n_unmasked > 0, n_unmasked, 0)
+        n_unmasked = gl.where(n_unmasked < num_tiles, n_unmasked, num_tiles)
+    else:
+        n_unmasked = 0
 
     """
     Prologue:
@@ -512,10 +530,7 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
 
     # QK_t0, SM0_t0
     qk = program.compute_qk(q, k)
-    if cfg.WINDOW_LEFT < 0:
-        if kv_start + cfg.BLOCK_N > program.q_start:
-            qk = program.apply_mask(qk, kv_start)
-    else:
+    if n_unmasked <= 0:
         qk = program.apply_mask(qk, kv_start)
     p, alpha, m_i = program.softmax_part0(qk, m_i)
 
@@ -524,26 +539,53 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
     k = program.tdm_shared_load_k(1, wait_count=2)
 
     """
-    Steady State (Hot Loop):
+    Steady State (Unmasked Hot Loop):
     t = i              t = i+1            t = i+2
     [SM1, LR_V, PV],   [QK, SM0],         [GLDS_K, GLDS_V]
 
-    Full-causal prefix tiles use the no-mask hot path. Sliding-window and
-    boundary tiles keep the TokenSpeed ragged/causal masks.
+    Full-causal tiles below the diagonal do not need a mask. This loop is the
+    peeled hot path: no per-tile causal/sliding mask branch in the QK cluster.
     """
-    for tile_idx in range(1, num_tiles - 1):
+    for tile_idx in range(1, n_unmasked):
         cur_kv_start = kv_start + tile_idx * cfg.BLOCK_N
         prev_buffer_index = (tile_idx - 1) % cfg.NUM_BUFFERS
         next_kv_start = cur_kv_start + cfg.BLOCK_N
         next_buffer_index = (tile_idx + 1) % cfg.NUM_BUFFERS
 
-        # QK, SM0 (mask only for sliding or causal boundary tiles)
+        # QK, SM0 (no mask needed - tile is fully below diagonal)
         qk = program.compute_qk(q, k)
-        if cfg.WINDOW_LEFT < 0:
-            if cur_kv_start + cfg.BLOCK_N > program.q_start:
-                qk = program.apply_mask(qk, cur_kv_start)
-        else:
-            qk = program.apply_mask(qk, cur_kv_start)
+
+        # SM1, LR_V, PV
+        p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+        v = program.tdm_shared_load_v(prev_buffer_index, wait_count=1)
+        acc = program.compute_pv(p, v, acc)
+
+        # GLDS_K, GLDS_V for t+1
+        program.tdm_load_global_to_shared_k(next_kv_start, next_buffer_index)
+        program.tdm_load_global_to_shared_v(next_kv_start, next_buffer_index)
+
+        # SM0, LR_K for t+1
+        p, alpha, m_i = program.softmax_part0(qk, m_i)
+        k = program.tdm_shared_load_k(next_buffer_index, wait_count=2)
+
+    """
+    Steady State (Masked Tail):
+    t = i              t = i+1            t = i+2
+    [SM1, LR_V, PV],   [QK, SM0],         [GLDS_K, GLDS_V]
+
+    Sliding-window tiles and causal diagonal/boundary tiles live here. Keeping
+    this loop separate preserves the unmasked hot path above.
+    """
+    masked_start = gl.where(n_unmasked > 1, n_unmasked, 1)
+    for tile_idx in range(masked_start, num_tiles - 1):
+        cur_kv_start = kv_start + tile_idx * cfg.BLOCK_N
+        prev_buffer_index = (tile_idx - 1) % cfg.NUM_BUFFERS
+        next_kv_start = cur_kv_start + cfg.BLOCK_N
+        next_buffer_index = (tile_idx + 1) % cfg.NUM_BUFFERS
+
+        # QK, SM0 (masked boundary/sliding tile)
+        qk = program.compute_qk(q, k)
+        qk = program.apply_mask(qk, cur_kv_start)
 
         # SM1, LR_V, PV
         p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
@@ -617,6 +659,10 @@ def _mha_prefill_gfx1250(
     SM_SCALE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    BATCH_SIZE: gl.constexpr,
+    MAX_Q_BLOCKS: gl.constexpr,
+    NUM_SMS: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
@@ -628,6 +674,7 @@ def _mha_prefill_gfx1250(
         SM_SCALE,
         BLOCK_M,
         BLOCK_N,
+        MAX_Q_BLOCKS,
         2,
         HAS_SINK,
         HAS_LSE,
@@ -636,24 +683,83 @@ def _mha_prefill_gfx1250(
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
     )
-    program = AttentionProgram.create(
-        cfg, q_ptr, k_ptr, v_ptr, output_ptr, sink_ptr, lse_ptr, cu_seqlens_ptr
-    )
-    if program.q_start < program.seq_len:
-        kv_start = 0
-        if cfg.WINDOW_LEFT >= 0:
-            kv_start = program.q_start - cfg.WINDOW_LEFT
-            kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
+    pid = gl.program_id(0)
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    local_programs: gl.constexpr = NUM_SMS // NUM_XCDS
+    q_heads_per_kv: gl.constexpr = N_HEADS // N_KV_HEADS
+    kv_groups_total: gl.constexpr = BATCH_SIZE * N_KV_HEADS
 
-        kv_end = program.q_start + cfg.BLOCK_M
-        kv_end = gl.where(kv_end < program.seq_len, kv_end, program.seq_len)
-        kv_end = ((kv_end + cfg.BLOCK_N - 1) // cfg.BLOCK_N) * cfg.BLOCK_N
+    if WINDOW_LEFT < 0:
+        tiles_per_unit: gl.constexpr = 2
+    else:
+        tiles_per_unit: gl.constexpr = 1
 
-        num_tiles = (kv_end - kv_start) // cfg.BLOCK_N
-        if num_tiles == 1:
-            process_single_attention_tile(program, kv_start)
-        else:
-            process_attention_tile(program, kv_start, num_tiles)
+    units_per_head: gl.constexpr = (
+        MAX_Q_BLOCKS + tiles_per_unit - 1
+    ) // tiles_per_unit
+    units_per_kv_group: gl.constexpr = q_heads_per_kv * units_per_head
+    kv_groups_per_xcd: gl.constexpr = (kv_groups_total + NUM_XCDS - 1) // NUM_XCDS
+    units: gl.constexpr = kv_groups_per_xcd * units_per_kv_group
+
+    unit = local_pid
+    while unit < units:
+        local_kv_group = unit // units_per_kv_group
+        unit_in_kv_group = unit - local_kv_group * units_per_kv_group
+        q_in_kv_group = unit_in_kv_group // units_per_head
+        bundle = unit_in_kv_group - q_in_kv_group * units_per_head
+        kv_group = xcd + local_kv_group * NUM_XCDS
+
+        if kv_group < kv_groups_total:
+            kv_head_base = kv_group % cfg.N_KV_HEADS
+            batch = kv_group // cfg.N_KV_HEADS
+            q_head = kv_head_base * q_heads_per_kv + q_in_kv_group
+
+            # Run q-heads that share one KV head on the same XCD. Causal uses
+            # folded q-block pairs to make each scheduling unit roughly
+            # constant cost; sliding-window tiles are already bounded.
+            for bundle_tile in gl.static_range(tiles_per_unit):
+                linear_q_block = bundle * tiles_per_unit + bundle_tile
+                if linear_q_block < cfg.MAX_Q_BLOCKS:
+                    if cfg.WINDOW_LEFT < 0:
+                        half = linear_q_block // 2
+                        q_block = gl.where(
+                            linear_q_block % 2 == 0,
+                            half,
+                            cfg.MAX_Q_BLOCKS - 1 - half,
+                        )
+                    else:
+                        q_block = linear_q_block
+
+                    program = AttentionProgram.create(
+                        cfg,
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        output_ptr,
+                        sink_ptr,
+                        lse_ptr,
+                        cu_seqlens_ptr,
+                        batch,
+                        q_head,
+                        q_block,
+                    )
+                    if program.q_start < program.seq_len:
+                        kv_start = 0
+                        if cfg.WINDOW_LEFT >= 0:
+                            kv_start = program.q_start - cfg.WINDOW_LEFT
+                            kv_start = gl.where(kv_start > 0, (kv_start // cfg.BLOCK_N) * cfg.BLOCK_N, 0)
+
+                        kv_end = program.q_start + cfg.BLOCK_M
+                        kv_end = gl.where(kv_end < program.seq_len, kv_end, program.seq_len)
+                        kv_end = ((kv_end + cfg.BLOCK_N - 1) // cfg.BLOCK_N) * cfg.BLOCK_N
+
+                        num_tiles = (kv_end - kv_start) // cfg.BLOCK_N
+                        if num_tiles == 1:
+                            process_single_attention_tile(program, kv_start)
+                        else:
+                            process_attention_tile(program, kv_start, num_tiles)
+        unit += local_programs
 
 
 class LaunchConfig(NamedTuple):
@@ -665,6 +771,9 @@ class LaunchConfig(NamedTuple):
     block_n: int
     batch_size: int
     max_seqlen: int
+    max_q_blocks: int
+    num_sms: int
+    num_xcds: int
     window_left: int
     grid: tuple[int, ...]
 
@@ -683,6 +792,9 @@ def get_config(
     batch_size = cu_seqlens_q.numel() - 1
     block_m = 128
     block_n = 64
+    max_q_blocks = triton_cdiv(max_seqlen, block_m)
+    num_sms = 256
+    num_xcds = 8
     sm_scale = (1.0 / math.sqrt(head_dim)) * _INV_LN2_VALUE
     return LaunchConfig(
         n_heads=n_heads,
@@ -693,8 +805,11 @@ def get_config(
         block_n=block_n,
         batch_size=batch_size,
         max_seqlen=max_seqlen,
+        max_q_blocks=max_q_blocks,
+        num_sms=num_sms,
+        num_xcds=num_xcds,
         window_left=window_left if window_left >= 0 else -1,
-        grid=(batch_size, n_heads, triton_cdiv(max_seqlen, block_m)),
+        grid=(num_sms,),
     )
 
 
@@ -761,6 +876,10 @@ def gluon_mha_prefill_gfx1250(
         config.sm_scale,
         config.block_m,
         config.block_n,
+        config.batch_size,
+        config.max_q_blocks,
+        config.num_sms,
+        config.num_xcds,
         sinks is not None,
         return_lse,
         config.window_left,
