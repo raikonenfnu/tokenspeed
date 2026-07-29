@@ -22,6 +22,9 @@
 
 from __future__ import annotations
 
+from tokenspeed_kernel_amd.ops.gemm.gated_rmsnorm_linear_gfx950 import (  # noqa: F401
+    gluon_gated_rmsnorm_linear_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gemm.mm_a16w16_gfx950 import (  # noqa: F401
     gluon_mm_a16w16_gfx950,
     gluon_mm_a16w16_mfma_lds_mediumm_gfx950,

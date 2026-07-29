@@ -54,6 +54,7 @@ from tokenspeed_kernel.ops.attention import (
 )
 from tokenspeed_kernel.ops.gemm import (
     bmm,
+    gated_rmsnorm_linear,
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
@@ -85,6 +86,7 @@ __all__ = [
     "NoKernelFoundError",
     # gemm
     "bmm",
+    "gated_rmsnorm_linear",
     "kimi3_latent_projection",
     "kimi3_mla_qkv_gate_projection",
     "kimi3_latent_projection_add3",

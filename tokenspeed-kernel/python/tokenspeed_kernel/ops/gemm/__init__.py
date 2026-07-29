@@ -30,6 +30,7 @@ import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.gemm.gated_rmsnorm_linear import gated_rmsnorm_linear
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
@@ -39,6 +40,11 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
 )
+from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
+    linear_attnres_partials,
+)
+from tokenspeed_kernel.ops.gemm.moe_input_projections import moe_input_projections
+from tokenspeed_kernel.ops.gemm.rmsnorm_linear_add import rmsnorm_linear_add
 from tokenspeed_kernel.platform import ArchVersion, Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -54,6 +60,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "bmm",
+    "gated_rmsnorm_linear",
+    "linear_attnres_partials",
+    "moe_input_projections",
+    "rmsnorm_linear_add",
     "kimi3_latent_projection",
     "kimi3_mla_qkv_gate_projection",
     "kimi3_latent_projection_add3",

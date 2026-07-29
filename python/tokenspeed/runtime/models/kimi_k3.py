@@ -66,7 +66,6 @@ from tokenspeed_kernel.ops.activation.triton import (
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
-    rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
 from tokenspeed_kernel.ops.attention import (
@@ -76,6 +75,7 @@ from tokenspeed_kernel.ops.attention import (
 from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.gemm import (
+    gated_rmsnorm_linear,
     kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
@@ -626,8 +626,7 @@ class KimiKDAMergedProj(nn.Module):
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Registry-dispatched: rowcta at M=1, cublasLt otherwise.
-        out = decode_gemv(x, self.weight)
+        out = kimi3_qkvfab_projection(x, self.weight)
         p = self.proj_local
         mixed_qkv = out[:, : 3 * p]
         # No-op at decode (single row); prefill pays a small copy for the conv.
@@ -845,17 +844,17 @@ class KimiLinearKDA(nn.Module):
             seq_len=num_tokens,
         )
 
-        # Per-head gated RMSNorm + sigmoid output gate in one kernel.
-        core_out = rmsnorm_gated_sigmoid(
-            core_out.reshape(num_tokens, hn * hd).contiguous(),
-            out_gate.contiguous(),
+        core_out = core_out.reshape(num_tokens, hn * hd).contiguous()
+        out_gate = out_gate.contiguous()
+        return gated_rmsnorm_linear(
+            core_out,
+            out_gate,
             self.o_norm.weight,
-            self.o_norm.variance_epsilon,
-            hn,
-            hd,
+            self.o_proj.weight,
+            eps=self.o_norm.variance_epsilon,
+            group_size=hd,
+            gate_kind="sigmoid",
         )
-        output, _ = self.o_proj(core_out)
-        return output
 
 
 class KimiLinearMoEGate(nn.Module):
