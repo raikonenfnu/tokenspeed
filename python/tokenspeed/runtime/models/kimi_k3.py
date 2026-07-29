@@ -83,6 +83,7 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
     moe_input_projections,
+    rmsnorm_linear_add,
 )
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
@@ -101,6 +102,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce_two,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
+    prepare_all_reduce_two,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
@@ -1235,11 +1237,29 @@ class KimiLinearMoE(nn.Module):
             up_clamp=self.shared_experts.act_fn.linear_beta,
         )
         topk_output = self.topk(hidden_states, router_logits)
-        routed_output = hidden_states.new_empty(
-            (hidden_states.shape[0], self.routed_expert_down_proj.weight.shape[0])
+        staging = prepare_all_reduce_two(
+            (hidden_states.shape[0], self.shared_experts.down_proj.weight.shape[0]),
+            (hidden_states.shape[0], self.routed_expert_down_proj.weight.shape[0]),
+            hidden_states.dtype,
+            self.mapping.moe.ep_group,
         )
-        shared_output = hidden_states.new_empty(
-            (hidden_states.shape[0], self.shared_experts.down_proj.weight.shape[0])
+        shared_staging, routed_staging = (
+            staging
+            if staging is not None
+            else (
+                hidden_states.new_empty(
+                    (
+                        hidden_states.shape[0],
+                        self.shared_experts.down_proj.weight.shape[0],
+                    )
+                ),
+                hidden_states.new_empty(
+                    (
+                        hidden_states.shape[0],
+                        self.routed_expert_down_proj.weight.shape[0],
+                    )
+                ),
+            )
         )
         routed_latent, shared_output = latent_moe_expert_shared(
             routed_input,
@@ -1255,20 +1275,27 @@ class KimiLinearMoE(nn.Module):
             linear_clamp=self.experts.activation_situ_linear_beta,
             expert_start=self.experts.ep_rank * self.experts.num_local_experts,
             w13_interleaved=self.experts.w13_input_layout == "interleaved",
-            routed_out=routed_output,
-            shared_out=shared_output,
+            routed_out=routed_staging,
+            shared_out=shared_staging,
         )
         shared_output, routed_latent = all_reduce_two(
             shared_output,
             routed_latent,
             group=self.mapping.moe.ep_group,
         )
-        if self.routed_expert_norm is not None:
-            routed_latent = self.routed_expert_norm(routed_latent)
-        return self.routed_expert_up_proj.forward_add3(
+        if self.routed_expert_norm is None:
+            return self.routed_expert_up_proj.forward_add3(
+                routed_latent,
+                prefix_sum,
+                shared_output,
+            )
+        return rmsnorm_linear_add(
             routed_latent,
+            self.routed_expert_norm.weight,
+            self.routed_expert_up_proj.weight,
             prefix_sum,
             shared_output,
+            eps=self.routed_expert_norm.variance_epsilon,
         )
 
     def forward(
