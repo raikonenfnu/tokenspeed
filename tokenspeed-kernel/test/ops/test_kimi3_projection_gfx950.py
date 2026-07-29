@@ -141,12 +141,256 @@ def test_kimi3_latent_projection_add3_matches_torch_and_captures(
 def test_kimi3_latent_projection_rejects_forced_kernel_for_non_k3_shape() -> None:
     hidden_states = torch.empty(1, 128, device="cuda", dtype=torch.bfloat16)
     weight = torch.empty(64, 128, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="requires a contiguous gfx950"):
+    with pytest.raises(ValueError, match="requires a supported contiguous"):
         tokenspeed_kernel.kimi3_latent_projection(
             hidden_states,
             weight,
             solution="triton_gemv",
         )
+
+
+def test_kimi3_latent_projection_falls_back_for_generic_shape() -> None:
+    hidden_states = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
+
+    actual = tokenspeed_kernel.kimi3_latent_projection(hidden_states, weight)
+
+    torch.testing.assert_close(
+        actual,
+        torch.nn.functional.linear(hidden_states, weight),
+    )
+
+
+def test_kimi3_latent_projection_add3_matches_unfused() -> None:
+    torch.manual_seed(17)
+    hidden_states = torch.randn(1, 3584, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(7168, 3584, device="cuda", dtype=torch.bfloat16)
+    addend_a = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
+    addend_c = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
+
+    projected = tokenspeed_kernel.kimi3_latent_projection(hidden_states, weight)
+    expected = (addend_a.float() + projected.float() + addend_c.float()).to(
+        torch.bfloat16
+    )
+    actual = tokenspeed_kernel.kimi3_latent_projection_add3(
+        hidden_states,
+        weight,
+        addend_a,
+        addend_c,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "local_heads,head_dim,output_size,gate_kind",
+    [
+        (3, 256, 7168, "sigmoid"),
+        (12, 128, 7168, "sigmoid"),
+        (8, 128, 4096, "silu"),
+    ],
+)
+def test_gated_rmsnorm_linear_matches_split_and_captures(
+    local_heads: int,
+    head_dim: int,
+    output_size: int,
+    gate_kind: str,
+) -> None:
+    from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+    torch.manual_seed(41)
+    projected = local_heads * head_dim
+    recurrent = torch.randn(1, projected, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn(1, projected, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
+    projection_weight = (
+        torch.randn(
+            output_size,
+            projected,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        * 0.02
+    )
+    output = torch.empty(1, output_size, device="cuda", dtype=torch.bfloat16)
+    eps = 1e-6
+    recurrent_heads = recurrent.float().reshape(1, local_heads, head_dim)
+    inverse_rms = torch.rsqrt(recurrent_heads.square().mean(dim=-1, keepdim=True) + eps)
+    gate_heads = gate.float().reshape_as(recurrent_heads)
+    gate_activation = torch.sigmoid(gate_heads)
+    if gate_kind == "silu":
+        gate_activation *= gate_heads
+    normalized = (
+        recurrent_heads * inverse_rms * norm_weight.float() * gate_activation
+    ).reshape_as(recurrent)
+    expected = decode_gemv(normalized.to(torch.bfloat16), projection_weight)
+
+    tokenspeed_kernel.gated_rmsnorm_linear(
+        recurrent,
+        gate,
+        norm_weight,
+        projection_weight,
+        eps=eps,
+        group_size=head_dim,
+        gate_kind=gate_kind,
+        out=output,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        returned = tokenspeed_kernel.gated_rmsnorm_linear(
+            recurrent,
+            gate,
+            norm_weight,
+            projection_weight,
+            eps=eps,
+            group_size=head_dim,
+            gate_kind=gate_kind,
+            out=output,
+        )
+    assert returned.data_ptr() == output.data_ptr()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("num_heads", [12, 16])
+@pytest.mark.parametrize("num_tokens", [1, 2])
+def test_mla_absorb_query_matches_split_and_captures(
+    num_tokens: int,
+    num_heads: int,
+) -> None:
+    torch.manual_seed(61)
+    query = torch.randn(num_tokens, num_heads, 192, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(num_heads, 128, 512, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(
+        num_tokens, num_heads, 576, device="cuda", dtype=torch.bfloat16
+    )
+    q_nope, q_pe = query.split((128, 64), dim=-1)
+    expected = torch.empty_like(output)
+    projected = torch.bmm(q_nope.transpose(0, 1).contiguous(), weight)
+    expected[..., :512].copy_(projected.transpose(0, 1))
+    expected[..., 512:].copy_(q_pe)
+
+    tokenspeed_kernel.mla_absorb_query(
+        q_nope,
+        weight,
+        query_rope=q_pe,
+        out=output,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        returned = tokenspeed_kernel.mla_absorb_query(
+            q_nope,
+            weight,
+            query_rope=q_pe,
+            out=output,
+        )
+    assert returned.data_ptr() == output.data_ptr()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("output_width", [2304, 3072])
+def test_mla_normalize_project_query_matches_split_and_captures(
+    output_width: int,
+) -> None:
+    from tokenspeed_kernel.ops.gemm.triton_gemv import rowcta_gemv
+    from tokenspeed_kernel.ops.layernorm.triton import rmsnorm_fused_parallel
+
+    torch.manual_seed(66)
+    query = torch.randn(1, 1536, device="cuda", dtype=torch.bfloat16)
+    kv_input = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
+    kv_expected = kv_input.clone()
+    kv_output = kv_input.clone()
+    q_norm_weight = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
+    kv_norm_weight = torch.randn(512, device="cuda", dtype=torch.bfloat16)
+    projection_weight = torch.randn(
+        output_width, 1536, device="cuda", dtype=torch.bfloat16
+    )
+    q_norm = torch.empty_like(query)
+    expected = torch.empty(1, output_width, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty_like(expected)
+    rmsnorm_fused_parallel(
+        query,
+        q_norm_weight,
+        q_norm,
+        kv_expected,
+        kv_norm_weight,
+        kv_expected,
+        1e-5,
+    )
+    rowcta_gemv(q_norm, projection_weight, expected)
+
+    tokenspeed_kernel.mla_normalize_project_query(
+        query,
+        kv_output,
+        q_norm_weight,
+        kv_norm_weight,
+        projection_weight,
+        eps=1e-5,
+        out=output,
+    )
+    kv_output.copy_(kv_input)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        returned = tokenspeed_kernel.mla_normalize_project_query(
+            query,
+            kv_output,
+            q_norm_weight,
+            kv_norm_weight,
+            projection_weight,
+            eps=1e-5,
+            out=output,
+        )
+    assert returned.data_ptr() == output.data_ptr()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(kv_output, kv_expected, atol=0, rtol=0)
+    torch.testing.assert_close(output, expected, atol=4e-3, rtol=0)
+
+
+@pytest.mark.parametrize("num_heads", [12, 16])
+@pytest.mark.parametrize("use_gate", [False, True])
+def test_mla_project_value_matches_split_and_captures(
+    num_heads: int,
+    use_gate: bool,
+) -> None:
+    from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+
+    torch.manual_seed(63)
+    attention = torch.randn(1, num_heads, 512, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(num_heads, 512, 128, device="cuda", dtype=torch.bfloat16)
+    raw_gate = torch.randn(1, num_heads * 128, device="cuda", dtype=torch.bfloat16)
+    gate = raw_gate if use_gate else None
+    output = torch.empty_like(raw_gate)
+    projected = torch.bmm(attention.transpose(0, 1).contiguous(), weight)
+    expected = projected.transpose(0, 1).reshape_as(output).contiguous()
+    if gate is not None:
+        sigmoid_mul(expected, gate)
+
+    tokenspeed_kernel.mla_project_value(
+        attention,
+        weight,
+        gate=gate,
+        out=output,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        returned = tokenspeed_kernel.mla_project_value(
+            attention,
+            weight,
+            gate=gate,
+            out=output,
+        )
+    assert returned.data_ptr() == output.data_ptr()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
 
 def test_kimi3_qkvfab_projection_matches_torch_and_captures() -> None:

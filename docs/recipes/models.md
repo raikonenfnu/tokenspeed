@@ -178,10 +178,31 @@ Notes:
   selects the existing FLA-derived NVIDIA implementation or the native AMD
   implementation, including each backend's preferred recurrent-state layout.
   The runtime does not transpose or reinterpret that state.
+- Gated MLA decode uses the same vendor-neutral boundary. The runtime requests
+  projected-value decode, and the kernel registry selects a fused
+  attention/value-projection/gate implementation when the device, dtype, and
+  shape support it. Other configurations use the portable split fallback.
+- Decode fusions are exposed by tensor semantics rather than by the K3 model
+  name or environment switches. The reusable boundaries include MLA query
+  absorption, query/KV normalization and projection, grouped gated RMSNorm
+  projection, independent latent-MoE input projections, joint routed/shared
+  expert execution, RMSNorm-linear-residual accumulation, and a linear
+  projection with two independent AttnRes partials. Model code supplies
+  dimensions and activation behavior; the kernel registry selects a portable
+  composition or an architecture-tuned backend.
+- Fusions preserve the same materialization boundaries as their split
+  equivalents, including BF16 rounding before downstream projections. A
+  model-specific multi-operation kernel should only be added when an
+  end-to-end benchmark demonstrates a gain that cannot be expressed as one of
+  these semantic operations. Launch-only combinations without such a gain
+  remain separate operations so their scheduling and fallbacks stay clear.
 - NVIDIA auto-selects `--attention-backend tokenspeed_mla` for K3 FlatKV
   (fp8 KV required). AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
   parsers. Explicit parser flags override these defaults.
+- On gfx950 with TP8/EP8, one-token decode fuses the routed latent
+  RMSNorm/up-projection with the residual/shared-output add epilogue. Other
+  batch sizes, devices, and parallel layouts retain the ordinary fallbacks.
 - Point `--model` at a **flattened local copy** of the checkpoint: real files
   for the configs/tokenizer/`*.py` (weights may stay symlinks). An HF hub
   snapshot directory fails engine startup — `tokenization_kimi.py`'s relative
@@ -276,8 +297,12 @@ tokenspeed serve moonshotai/Kimi-K3 \
 
 On gfx950, the replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
-to the current token count. The fused sigmoid-bias top-k route supports the
-full scheduled token count.
+to the current token count. One-token TP8/EP8 decode also automatically
+selects Gluon implementations for the semantic fusion boundaries described
+above. No `TOKENSPEED_K3_*_MEGA`, direct-output, or AttnRes fusion flags are
+required. Unsupported shapes and other architectures retain the portable
+compositions. The fused sigmoid-bias top-k route supports the full scheduled
+token count.
 
 ## GLM5 / GLM5.2
 
