@@ -31,7 +31,7 @@ import torch
 from tokenspeed_kernel.ops.communication import (
     allreduce_lane_latent_norm_supported,
 )
-from tokenspeed_kernel.ops.moe import kimi3_native_moe_available
+from tokenspeed_kernel.ops.moe import native_latent_moe_available
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import (
@@ -113,7 +113,7 @@ class Kimi3MoEExecutionPlan:
     ) -> "Kimi3MoEExecutionPlan":
         """Select orchestration without exposing platform policy to the model."""
 
-        use_native = kimi3_native_moe_available()
+        use_native = native_latent_moe_available()
         use_sidecar = not use_native and (
             moe_backend.is_auto() or moe_backend.is_flashinfer_trtllm()
         )
@@ -167,11 +167,10 @@ class Kimi3MoEExecutionPlan:
 
 
 class Kimi3LatentProjection(ReplicatedLinear):
-    """Replicated K3 H↔L projection using tuned gfx950 kernels.
+    """Replicated latent projection with kernel-owned specialization.
 
-    The checkpoint stores both projections in BF16 and excludes them from its
-    MXFP4 policy. Tuned middle/large-M shapes use Gluon; one-token decode uses
-    the bandwidth-oriented Triton GEMV. Other shapes retain the vendor GEMM.
+    Tuned shapes use registered accelerator kernels. Other shapes retain the
+    ordinary dense projection without requiring model-side shape selection.
     """
 
     def __init__(
@@ -200,6 +199,20 @@ class Kimi3LatentProjection(ReplicatedLinear):
             solution=self.solution,
         )
         return output, None
+
+    def forward_add3(
+        self,
+        hidden_states: torch.Tensor,
+        addend_a: torch.Tensor,
+        addend_c: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project routed latents and accumulate two full-width addends."""
+        return tokenspeed_kernel.kimi3_latent_projection_add3(
+            hidden_states,
+            self.weight,
+            addend_a,
+            addend_c,
+        )
 
 
 def _module_tensor_output(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -245,6 +258,7 @@ class LatentMoELayer(nn.Module):
         shared_expert_stream: torch.cuda.Stream | None = None,
         expert_parallel_group: tuple[int, ...] | None = None,
         return_separate_outputs: bool = False,
+        defer_routed_up_projection: bool = False,
     ) -> None:
         super().__init__()
         if shared_reduce is not None and shared_experts is None:
@@ -256,6 +270,13 @@ class LatentMoELayer(nn.Module):
         ):
             raise ValueError(
                 "joint_reduce cannot be combined with latent_reduce or shared_reduce"
+            )
+        if defer_routed_up_projection and (
+            not return_separate_outputs or shared_experts is None
+        ):
+            raise ValueError(
+                "defer_routed_up_projection requires shared_experts and "
+                "return_separate_outputs"
             )
         expert_parallel_size = int(getattr(experts, "ep_size", 1))
         num_experts = int(getattr(experts, "num_experts", 1))
@@ -294,6 +315,7 @@ class LatentMoELayer(nn.Module):
         self.joint_reduce = joint_reduce
         self.stream_fork = StreamFork(shared_expert_stream)
         self.return_separate_outputs = return_separate_outputs
+        self.defer_routed_up_projection = defer_routed_up_projection
 
     def forward(
         self,
@@ -383,8 +405,8 @@ class LatentMoELayer(nn.Module):
             )
             _check_shape(routed_latent, latent_shape, "routed experts")
 
-        # Iris spin-wait collectives cannot safely overlap an all-CU GEMM on
-        # gfx950. Join both compute branches first. Individual reducers retain
+        # Spin-wait collectives cannot safely overlap an all-device GEMM.
+        # Join both compute branches first. Individual reducers retain
         # the established shared-before-routed order; a joint reducer handles
         # both partials after the routed experts finish.
         if overlap_shared and self.shared_reduce is not None:
@@ -407,14 +429,18 @@ class LatentMoELayer(nn.Module):
             routed_latent = _module_tensor_output(self.routed_norm, routed_latent)
             _check_shape(routed_latent, latent_shape, "routed_norm")
 
-        routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
-        _check_shape(routed_output, output_shape, "routed_up_proj")
-
         if shared_output is None:
+            routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
+            _check_shape(routed_output, output_shape, "routed_up_proj")
             return routed_output
+        if not self.defer_routed_up_projection:
+            routed_output = _module_tensor_output(self.routed_up_proj, routed_latent)
+            _check_shape(routed_output, output_shape, "routed_up_proj")
         if self.shared_reduce is not None and not shared_reduction_applied:
             shared_output = self.shared_reduce(shared_output)
             _check_shape(shared_output, output_shape, "shared_reduce")
+        if self.defer_routed_up_projection:
+            return routed_latent, shared_output
         if self.return_separate_outputs:
             return routed_output, shared_output
         return routed_output + shared_output

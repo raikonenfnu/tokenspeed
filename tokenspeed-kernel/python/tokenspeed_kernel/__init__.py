@@ -69,6 +69,7 @@ from tokenspeed_kernel.ops.moe import (
     moe_plan,
     moe_process_weights,
     moe_sigmoid_bias_topk,
+    native_latent_moe_available,
 )
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
@@ -127,6 +128,7 @@ __all__ = [
     "add3",
     "situ_and_mul",
     # moe
+    "native_latent_moe_available",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",

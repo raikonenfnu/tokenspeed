@@ -29,7 +29,9 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
-    "kimi3_native_moe_available",
+    "native_latent_moe_available",
+    "latent_moe_decode_pipeline_available",
+    "latent_moe_expert_shared",
     "moe_apply",
     "moe_grouped_routing",
     "moe_plan",
@@ -41,9 +43,11 @@ __all__ = [
 from tokenspeed_kernel.ops.moe.grouped_routing import (  # noqa: E402
     moe_grouped_routing,
 )
-from tokenspeed_kernel.ops.moe.kimi3 import (  # noqa: E402
-    kimi3_native_moe_available,
+from tokenspeed_kernel.ops.moe.latent_decode import (  # noqa: E402
+    latent_moe_decode_pipeline_available,
+    latent_moe_expert_shared,
 )
+from tokenspeed_kernel.ops.moe.native import native_latent_moe_available  # noqa: E402
 from tokenspeed_kernel.ops.moe.sigmoid_topk import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe.unfused import moe_unfused_apply  # noqa: E402
 
