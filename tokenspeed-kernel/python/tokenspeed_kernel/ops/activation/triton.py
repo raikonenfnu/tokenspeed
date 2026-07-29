@@ -481,7 +481,7 @@ def situ_and_mul(
         out_stride_row=flat_out.stride(0),
         HAS_LINEAR_BETA=linear_beta is not None,
         BLOCK_SIZE=block_size,
-        num_warps=4,
+        num_warps=8,
     )
     if kernel_out is not out:
         out.copy_(kernel_out)

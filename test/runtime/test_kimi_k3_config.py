@@ -148,6 +148,28 @@ class KimiK3ConfigTests(unittest.TestCase):
 
 
 class KimiK3RegistrationTests(unittest.TestCase):
+    def test_kimi_router_delegates_platform_selection_to_kernel_api(self):
+        import tokenspeed.runtime.models.kimi_k3 as kimi_k3
+
+        gate = kimi_k3.KimiLinearMoEGate(7168, 896)
+        hidden_states = torch.empty((4, 7168), dtype=torch.bfloat16)
+        expected = torch.empty((4, 896), dtype=torch.float32)
+
+        with (
+            mock.patch.object(kimi_k3, "pdl_enabled", return_value=True),
+            mock.patch.object(
+                kimi_k3, "kimi3_router_projection", return_value=expected
+            ) as router,
+        ):
+            actual = gate(hidden_states)
+
+        self.assertIs(actual, expected)
+        router.assert_called_once_with(
+            hidden_states,
+            gate.weight,
+            enable_pdl=True,
+        )
+
     def test_shared_projection_preserves_direct_write_output(self):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3
 
@@ -359,7 +381,14 @@ class KimiK3RegistrationTests(unittest.TestCase):
         self.assertFalse(shared_calls[0]["reduce_results"])
         joint_reduce = layer.native_latent_moe.components["joint_reduce"]
         self.assertIs(joint_reduce.func, kimi_k3.all_reduce_two)
-        self.assertEqual(joint_reduce.keywords, {"group": ep_group})
+        self.assertEqual(joint_reduce.keywords["group"], ep_group)
+        self.assertIs(
+            layer.native_latent_moe.components["routed_norm"],
+            layer.routed_expert_norm,
+        )
+        self.assertTrue(
+            layer.native_latent_moe.components["defer_routed_up_projection"]
+        )
 
     def test_mla_gate_projection_splits_prefill_and_fuses_decode(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
@@ -380,6 +409,11 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 return value
 
         class CopyNorm(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight_q_a = torch.nn.Parameter(torch.ones(2))
+                self.weight_kv_a = torch.nn.Parameter(torch.ones(3))
+
             def forward(self, *, input_q_a, input_kv_a, output_q_a):
                 output_q_a.copy_(input_q_a)
 
@@ -400,20 +434,32 @@ class KimiK3RegistrationTests(unittest.TestCase):
         attention._gate_width = 4
         attention.fused_qkv_a_proj_with_mqa = FakeProjection()
         attention.fused_qk_layernorm = CopyNorm()
+        attention.q_a_layernorm = SimpleNamespace(variance_epsilon=1e-6)
         attention.q_b_proj = IdentityQProjection()
         comm = IdentityComm()
 
         prefill = torch.ones(33, 5)
-        q, latent, gate = attention._project_q_latent_gated(prefill, None, comm, None)
+        with torch.no_grad():
+            q, latent, gate = attention._project_q_latent_gated(
+                prefill, None, comm, None
+            )
         expected = torch.nn.functional.linear(
             prefill, attention.fused_qkv_a_proj_with_mqa.weight
         )
-        torch.testing.assert_close(q, expected[:, :2])
-        torch.testing.assert_close(latent, expected[:, 2:6])
+        q_a = expected[:, :2].float()
+        q_expected = q_a * torch.rsqrt(q_a.square().mean(dim=-1, keepdim=True) + 1e-6)
+        kv_a = expected[:, 2:5].float()
+        kv_expected = kv_a * torch.rsqrt(
+            kv_a.square().mean(dim=-1, keepdim=True) + 1e-6
+        )
+        torch.testing.assert_close(q, q_expected)
+        torch.testing.assert_close(latent[:, :3], kv_expected)
+        torch.testing.assert_close(latent[:, 3:], expected[:, 5:6])
         torch.testing.assert_close(gate, expected[:, 6:])
         self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
 
-        attention._project_q_latent_gated(prefill[:1], None, comm, None)
+        with torch.no_grad():
+            attention._project_q_latent_gated(prefill[:1], None, comm, None)
         # Decode routes through the registered GEMV using the packed weight
         # directly, so neither branch materializes the projection module.
         self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)

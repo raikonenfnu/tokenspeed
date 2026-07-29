@@ -55,9 +55,13 @@ Module hierarchy matches the checkpoint::
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
 from collections.abc import Iterable
-from functools import partial
+from functools import lru_cache, partial
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -76,17 +80,14 @@ from tokenspeed_kernel.ops.attn_res import attn_res_fwd
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.gemm import (
     gated_rmsnorm_linear,
-    kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
     kimi3_router_projection,
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
+    linear_attnres_partials,
     moe_input_projections,
     rmsnorm_linear_add,
-)
-from tokenspeed_kernel.ops.gemm.triton_gemv import (
-    decode_gemv,
 )
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
@@ -99,6 +100,7 @@ from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
+    all_reduce_residual_attnres,
     all_reduce_two,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
@@ -398,11 +400,35 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         ctx: "ForwardContext",
         comm_manager: CommManager,
         block_scale: torch.Tensor | None,
+        attnres_partial_args: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project MLA Q, latent KV, and the local output gate in one GEMM."""
         if block_scale is not None:
             qkv_gate = self.fused_qkv_a_proj_with_mqa(
                 hidden_states, block_scale, torch.bfloat16
+            )
+            if attnres_partial_args is not None:
+                attnres_partial_dual(*attnres_partial_args)
+            qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
+            q_a, latent_cache, gate = qkv_gate.split(
+                [
+                    self.q_lora_rank,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    self._gate_width,
+                ],
+                dim=-1,
+            )
+        elif attnres_partial_args is not None:
+            blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
+            qkv_gate = linear_attnres_partials(
+                hidden_states,
+                self.fused_qkv_a_proj_with_mqa.weight,
+                blocks,
+                weight_a,
+                weight_b,
+                scratch_a,
+                scratch_b,
+                eps=eps,
             )
             qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
             q_a, latent_cache, gate = qkv_gate.split(
@@ -455,14 +481,21 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
+        attnres_partial_args: tuple | None = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
         if self.use_output_gate:
             q, latent_cache, gate = self._project_q_latent_gated(
-                hidden_states, ctx, comm_manager, block_scale
+                hidden_states,
+                ctx,
+                comm_manager,
+                block_scale,
+                attnres_partial_args,
             )
         else:
+            if attnres_partial_args is not None:
+                attnres_partial_dual(*attnres_partial_args)
             q, latent_cache = self._project_q_latent(
                 hidden_states, ctx, comm_manager, block_scale
             )
@@ -522,6 +555,7 @@ def _apply_attn_res(
         norm.weight,
         norm.variance_epsilon,
         out_norm_weight=None if out_norm is None else out_norm.weight,
+        out_norm_eps=None if out_norm is None else out_norm.variance_epsilon,
     )
 
 
@@ -541,6 +575,95 @@ def _situ_sidecar_unavailable_reason() -> str | None:
     except ImportError as exc:  # non-NVIDIA build or older tokenspeed-kernel
         return f"flashinfer TRT-LLM MXFP4 ops are unavailable: {exc}"
     return private_situ_runtime_status()
+
+
+@lru_cache(maxsize=4)
+def _load_k3_expert_map(
+    path: str,
+    num_layers: int,
+    num_experts: int,
+    ep_size: int,
+) -> tuple[tuple[int, ...], ...]:
+    """Load and validate an opt-in K3 logical-to-physical expert map."""
+
+    payload = json.loads(Path(path).read_text())
+    rows = payload.get("logical_to_physical")
+    if not isinstance(rows, list) or len(rows) != num_layers:
+        raise ValueError(
+            "K3 expert map must contain logical_to_physical with one row per layer"
+        )
+    expected = list(range(num_experts))
+    validated: list[tuple[int, ...]] = []
+    for layer_id, row in enumerate(rows):
+        if not isinstance(row, list) or len(row) != num_experts:
+            raise ValueError(
+                f"K3 expert map layer {layer_id} must contain {num_experts} ids"
+            )
+        if sorted(row) != expected:
+            raise ValueError(
+                f"K3 expert map layer {layer_id} must be a permutation of "
+                f"[0, {num_experts})"
+            )
+        validated.append(tuple(int(value) for value in row))
+    if num_experts % ep_size:
+        raise ValueError("K3 mapped experts must divide evenly across EP ranks")
+    return tuple(validated)
+
+
+def _k3_expert_map_rows(
+    config: KimiLinearConfig,
+    ep_size: int,
+) -> tuple[tuple[int, ...], ...] | None:
+    path = os.environ.get("TOKENSPEED_K3_EXPERT_MAP")
+    if not path:
+        return None
+    return _load_k3_expert_map(
+        path,
+        config.num_hidden_layers,
+        config.num_experts,
+        ep_size,
+    )
+
+
+_K3_EXPERT_WEIGHT_RE = re.compile(
+    r"^(?P<prefix>.*(?:^|\.)layers\.(?P<layer>\d+)\..*?)"
+    r"experts\.(?P<expert>\d+)\.(?P<shard>w[123])\.(?P<suffix>.+)$"
+)
+
+
+def _k3_mapped_expert_target(
+    name: str,
+    expert_rows: tuple[tuple[int, ...], ...],
+    *,
+    ep_rank: int,
+    ep_size: int,
+) -> tuple[bool, tuple[str, str, int] | None]:
+    """Resolve a mapped K3 checkpoint expert to this rank's physical slot.
+
+    Returns ``(False, None)`` for non-expert tensors, ``(True, None)`` for an
+    expert owned by another EP rank, and the fused parameter name, shard id,
+    and local physical slot for a locally owned expert.
+    """
+
+    match = _K3_EXPERT_WEIGHT_RE.match(name)
+    if match is None:
+        return False, None
+    layer_id = int(match.group("layer"))
+    logical_expert = int(match.group("expert"))
+    if not 0 <= layer_id < len(expert_rows):
+        raise ValueError(f"K3 expert checkpoint layer {layer_id} is out of range")
+    row = expert_rows[layer_id]
+    if not 0 <= logical_expert < len(row):
+        raise ValueError(f"K3 logical expert {logical_expert} is out of range")
+    physical_expert = row[logical_expert]
+    local_experts = len(row) // ep_size
+    owner = physical_expert // local_experts
+    if owner != ep_rank:
+        return True, None
+    shard_id = match.group("shard")
+    fused = "w2_" if shard_id == "w2" else "w13_"
+    param_name = match.group("prefix") + "experts." + fused + match.group("suffix")
+    return True, (param_name, shard_id, physical_expert % local_experts)
 
 
 def _situ_betas(config: KimiLinearConfig) -> tuple[float, float | None]:
@@ -775,17 +898,35 @@ class KimiLinearKDA(nn.Module):
         ).squeeze(1)
 
     def _project_qkvfab(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        attnres_partial_args: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project every KDA hidden-state consumer in one decode GEMV."""
+        """Project every KDA hidden-state consumer."""
         proj_local = self.local_num_heads * self.head_dim
-        output = kimi3_qkvfab_projection(
-            hidden_states,
-            self.qkvgb_proj.weight,
-        )
+        if attnres_partial_args is None:
+            output = kimi3_qkvfab_projection(
+                hidden_states,
+                self.qkvgb_proj.weight,
+            )
+        else:
+            blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
+            output = linear_attnres_partials(
+                hidden_states,
+                self.qkvgb_proj.weight,
+                blocks,
+                weight_a,
+                weight_b,
+                scratch_a,
+                scratch_b,
+                eps=eps,
+            )
         f_a_end = 4 * proj_local + self.head_dim
+        mixed_qkv = output[:, : 3 * proj_local]
+        if not mixed_qkv.is_contiguous():
+            mixed_qkv = mixed_qkv.contiguous()
         return (
-            output[:, : 3 * proj_local].contiguous(),
+            mixed_qkv,
             output[:, 3 * proj_local : 4 * proj_local],
             output[:, 4 * proj_local : f_a_end],
             output[:, f_a_end : self.qkvgb_proj.used_rows],
@@ -799,6 +940,7 @@ class KimiLinearKDA(nn.Module):
         out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
+        attnres_partial_args: tuple | None = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -817,7 +959,9 @@ class KimiLinearKDA(nn.Module):
         # the short causal conv (+ SiLU) and manages the conv / recurrent state
         # cache (KDA branch of MambaAttnBackend). g_raw is the raw decay-gate
         # input, beta the per-head logits (sigmoid applied in-kernel).
-        mixed_qkv, out_gate, f_a_out, beta = self._project_qkvfab(h)
+        mixed_qkv, out_gate, f_a_out, beta = self._project_qkvfab(
+            h, attnres_partial_args
+        )
         # f_b runs inside the backend: fused into the decode scan kernel, a
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
@@ -1016,6 +1160,16 @@ class KimiLinearMoE(nn.Module):
                 )
 
         self.gate = KimiLinearMoEGate(config.hidden_size, config.num_experts)
+        expert_rows = _k3_expert_map_rows(config, mapping.moe.ep_size)
+        logical_to_physical_map = (
+            None
+            if expert_rows is None
+            else torch.tensor(
+                expert_rows[layer_index],
+                dtype=torch.int32,
+                device=self.gate.weight.device,
+            )
+        )
 
         self.topk = TopK(
             top_k=self.top_k,
@@ -1031,6 +1185,7 @@ class KimiLinearMoE(nn.Module):
             topk_weights_dtype=(
                 torch.bfloat16 if self.use_trtllm_situ_moe else torch.float32
             ),
+            logical_to_physical_map=logical_to_physical_map,
         )
 
         # AMD native and the standalone TRT-LLM sidecar both consume K3's
@@ -1084,6 +1239,8 @@ class KimiLinearMoE(nn.Module):
             )
         self.act_fn = SituAndMul(beta=situ_beta, linear_beta=situ_linear_beta)
 
+        # The kernel boundary selects tuned implementations when applicable
+        # and preserves the ordinary dense projection everywhere else.
         self.routed_expert_down_proj = Kimi3LatentProjection(
             config.hidden_size,
             self.routed_hidden,
@@ -1108,7 +1265,6 @@ class KimiLinearMoE(nn.Module):
                 1,
             ),
         )
-
         self._topk_ready = torch.cuda.Event() if alt_stream is not None else None
 
         # Shared experts (SiTU dense MLP over the full hidden size).
@@ -1226,8 +1382,7 @@ class KimiLinearMoE(nn.Module):
         hidden_states: torch.Tensor,
         prefix_sum: torch.Tensor,
     ) -> torch.Tensor:
-        """Fuse K3 decode input projections and routed/shared expert execution."""
-
+        """Run joint routed/shared decode through semantic kernel operations."""
         router_logits, routed_input, shared_input = moe_input_projections(
             hidden_states,
             self.gate.weight,
@@ -1352,7 +1507,7 @@ class KimiLinearMoE(nn.Module):
                         lane[:, self.routed_hidden :] if lane is not None else None
                     ),
                 )
-            routed_in = decode_gemv(hidden_states, self.routed_expert_down_proj.weight)
+            routed_in = self.routed_expert_down_proj(hidden_states)[0]
             if self._topk_ready is not None and fork._active:
                 self._topk_ready.wait(torch.cuda.current_stream())
             routed_out = self._routed_experts(
@@ -1381,9 +1536,8 @@ class KimiLinearMoE(nn.Module):
                 enable_lane_norm=self.execution_plan.lane_latent_norm_ar,
                 max_token_num=self.execution_plan.comm_fusion_max_num_tokens,
             )
-            return kimi3_latent_projection_add3(
+            return self.routed_expert_up_proj.forward_add3(
                 routed_out,
-                self.routed_expert_up_proj.weight,
                 prefix_sum,
                 shared_out,
             ).view(num_tokens, hidden_size)
@@ -1568,6 +1722,19 @@ class KimiLinearDecoderLayer(nn.Module):
         layers, large batches and the plain-reduce fallback).
         """
         num_tokens = attn_partial.shape[0]
+        if combine is not None and prefix_sum is not None and num_tokens == 1:
+            scratch, _, _, out_norm_w, eps = combine
+            if out_norm_w is not None:
+                h, residual_out = all_reduce_residual_attnres(
+                    attn_partial,
+                    prefix_sum,
+                    self._mlp_wp,
+                    out_norm_w,
+                    scratch,
+                    eps,
+                    group=self.mapping.attn.tp_group,
+                )
+                return residual_out, h
         if (
             prefix_sum is not None
             and self._attn_ar_residual_fusion
@@ -1657,7 +1824,10 @@ class KimiLinearDecoderLayer(nn.Module):
         out_cache_loc: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        h, prefix_sum = self._mix_into_attention(hidden_states, block_residual)
+        h, prefix_sum = self._mix_into_attention(
+            hidden_states,
+            block_residual,
+        )
         # The mlp-side mixing's block partial hides under attention on the aux
         # stream (blocks are final for this layer once the snapshot above ran);
         # the combine after the attention AR only touches the prefix candidate.
@@ -1688,18 +1858,33 @@ class KimiLinearDecoderLayer(nn.Module):
             if split_mix
             else None
         )
-        with self.attn_fork.scope(enable=get_is_capture_mode()) as fork:
+        # A single-token ROCm graph pays more for the fork/join event nodes
+        # than this small partial can hide. Preserve overlap for wider graphs.
+        attnres_partial_args = None
+        with self.attn_fork.scope(
+            enable=get_is_capture_mode() and num_tokens > 1
+        ) as fork:
             with fork.branch():
                 if next_mix is not None:
                     nxt_layer, _ = next_mix
-                    attnres_partial_dual(
-                        block_residual[:mlp_valid_blocks],
-                        self._mlp_wp,
-                        nxt_layer._attn_wp,
-                        self.mlp_res_norm.variance_epsilon,
-                        scratch,
-                        sc1,
-                    )
+                    if num_tokens == 1:
+                        attnres_partial_args = (
+                            block_residual[:mlp_valid_blocks],
+                            self._mlp_wp,
+                            nxt_layer._attn_wp,
+                            self.mlp_res_norm.variance_epsilon,
+                            scratch,
+                            sc1,
+                        )
+                    else:
+                        attnres_partial_dual(
+                            block_residual[:mlp_valid_blocks],
+                            self._mlp_wp,
+                            nxt_layer._attn_wp,
+                            self.mlp_res_norm.variance_epsilon,
+                            scratch,
+                            sc1,
+                        )
                 elif split_mix:
                     attnres_partial(
                         block_residual[:mlp_valid_blocks],
@@ -1713,6 +1898,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
+                attnres_partial_args=attnres_partial_args,
             )
             prefix_sum, h_fused = self._reduce_attn_accumulate(
                 attn_out, prefix_sum, combine=ar_combine
@@ -1916,6 +2102,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
         fuse_qkv_a_proj = config.q_lora_rank is not None
 
         params_dict = dict(self.named_parameters())
+        expert_rows = _k3_expert_map_rows(config, self.mapping.moe.ep_size)
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=ExpertCheckpointSchema(
@@ -1944,6 +2131,28 @@ class KimiLinearForCausalLM(BaseCausalLM):
             # KDA conv weights are plain params named ``<qkv>_conv1d_weight``.
             if "_conv1d.weight" in name:
                 name = name.replace("_conv1d.weight", "_conv1d_weight")
+            if expert_rows is not None:
+                handled, mapped_expert = _k3_mapped_expert_target(
+                    name,
+                    expert_rows,
+                    ep_rank=self.mapping.moe.ep_rank,
+                    ep_size=self.mapping.moe.ep_size,
+                )
+                if handled:
+                    if mapped_expert is not None:
+                        param_name, shard_id, local_expert_id = mapped_expert
+                        param = params_dict.get(param_name)
+                        if param is None:
+                            raise ValueError(
+                                f"Mapped K3 expert parameter {param_name!r} was not found"
+                            )
+                        param.weight_loader(
+                            param,
+                            loaded_weight,
+                            shard_id=shard_id,
+                            local_expert_id=local_expert_id,
+                        )
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

@@ -9,6 +9,8 @@ kernel build is present) the CUDA kernel must match the torch fallback.
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -155,6 +157,43 @@ def _manual_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float):
 
 
 class AttnResOutNormTests(unittest.TestCase):
+    def test_amd_large_prefill_routes_inside_kernel_boundary(self):
+        import tokenspeed_kernel.ops.attn_res as attn_res_ops
+
+        prefix = torch.randn(33, 8, dtype=torch.bfloat16)
+        blocks = torch.randn(2, 33, 8, dtype=torch.bfloat16)
+        score_weight = torch.randn(8, dtype=torch.bfloat16)
+        rms_weight = torch.randn(8, dtype=torch.bfloat16)
+        out_weight = torch.randn(8, dtype=torch.bfloat16)
+        expected = torch.empty_like(prefix)
+        with (
+            patch.object(
+                attn_res_ops.Platform,
+                "get",
+                return_value=SimpleNamespace(is_amd=True),
+            ),
+            patch.object(
+                attn_res_ops,
+                "attn_res_rmsnorm",
+                return_value=expected,
+            ) as fused,
+        ):
+            actual = attn_res_ops.attn_res_fwd(
+                prefix,
+                blocks,
+                score_weight,
+                rms_weight,
+                eps=1e-5,
+                out_norm_weight=out_weight,
+                out_norm_eps=2e-5,
+            )
+
+        self.assertIs(actual, expected)
+        kwargs = fused.call_args.kwargs
+        self.assertEqual(kwargs["block_residual"].shape, (33, 2, 8))
+        self.assertEqual(kwargs["num_valid_blocks"], 2)
+        self.assertEqual(kwargs["output_eps"], 2e-5)
+
     def test_torch_fallback_out_norm_matches_separate(self):
         prefix_sum, block_residual, proj, norm = _make_inputs(11, seed=5)
         out_norm = RMSNorm(_HIDDEN, eps=_EPS)

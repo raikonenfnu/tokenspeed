@@ -55,3 +55,42 @@ def torch_attn_res_fwd(
         rs = (of.square().mean(-1, keepdim=True) + eps).rsqrt()
         out = (of * rs * out_norm_weight.float()).to(layer_residual.dtype)
     return out
+
+
+@register_kernel(
+    "attn_res",
+    "rmsnorm",
+    name="torch_attn_res_rmsnorm",
+    solution="torch",
+    signatures=format_signatures(
+        ("layer_residual", "block_residual"),
+        "dense",
+        {torch.float16, torch.bfloat16, torch.float32},
+    ),
+    priority=Priority.PORTABLE,
+    tags={"portability", "reference"},
+)
+def torch_attn_res_rmsnorm(
+    *,
+    layer_residual: torch.Tensor,
+    block_residual: torch.Tensor,
+    res_weight: torch.Tensor,
+    score_rms_weight: torch.Tensor,
+    score_eps: float,
+    output_rms_weight: torch.Tensor,
+    output_eps: float,
+    num_valid_blocks: int,
+) -> torch.Tensor:
+    """Reference implementation preserving the intermediate dtype boundary."""
+    values = torch.cat(
+        (block_residual[:, :num_valid_blocks], layer_residual.unsqueeze(1)), dim=1
+    ).float()
+    inverse_rms = torch.rsqrt(values.square().mean(-1, keepdim=True) + score_eps)
+    score_weight = score_rms_weight.float() * res_weight.float()
+    logits = (values * inverse_rms) @ score_weight
+    mixed = torch.matmul(logits.softmax(-1).unsqueeze(1), values).squeeze(1)
+    mixed = mixed.to(layer_residual.dtype).float()
+    inverse_output_rms = torch.rsqrt(mixed.square().mean(-1, keepdim=True) + output_eps)
+    return (mixed * inverse_output_rms * output_rms_weight.float()).to(
+        layer_residual.dtype
+    )

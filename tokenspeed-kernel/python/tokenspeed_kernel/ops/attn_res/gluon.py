@@ -39,6 +39,7 @@ if _attn_res_rmsnorm_impl is not None:
         traits={
             "fused_output_norm": frozenset({True}),
             "large_prefill": frozenset({True}),
+            "hidden_size": frozenset({4096, 5120, 6144, 7168, 8192}),
         },
         tags={"prefill", "fusion"},
     )
@@ -65,6 +66,28 @@ if _attn_res_rmsnorm_impl is not None:
             num_valid_blocks=block_residual.shape[0],
         )
 
+    @register_kernel(
+        "attn_res",
+        "rmsnorm",
+        name="gluon_attn_res_rmsnorm_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("layer_residual", "block_residual"), "dense", {torch.bfloat16}
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "hidden_size": frozenset({4096, 5120, 6144, 7168, 8192}),
+        },
+        tags={"prefill", "fusion"},
+    )
+    def gluon_attn_res_rmsnorm_gfx950(**kwargs) -> torch.Tensor:
+        return _attn_res_rmsnorm_impl(**kwargs)
+
 else:
 
     def gluon_attn_res_fwd_gfx950(**kwargs) -> torch.Tensor:
@@ -72,5 +95,10 @@ else:
             "gluon_attn_res_fwd_gfx950 requires tokenspeed-kernel-amd"
         ) from _IMPORT_ERROR
 
+    def gluon_attn_res_rmsnorm_gfx950(**kwargs) -> torch.Tensor:
+        raise ImportError(
+            "gluon_attn_res_rmsnorm_gfx950 requires tokenspeed-kernel-amd"
+        ) from _IMPORT_ERROR
 
-__all__ = ["gluon_attn_res_fwd_gfx950"]
+
+__all__ = ["gluon_attn_res_fwd_gfx950", "gluon_attn_res_rmsnorm_gfx950"]

@@ -299,6 +299,7 @@ class TopKConfig:
     # Shared-expert sink (Inkling)
     num_sink_experts: int = 0
     sink_global_scale: torch.Tensor | None = None
+    logical_to_physical_map: torch.Tensor | None = None
 
 
 class StandardTopKOutput(NamedTuple):
@@ -357,6 +358,7 @@ class TopK(torch.nn.Module):
         topk_weights_dtype: torch.dtype = torch.float32,
         num_sink_experts: int = 0,
         sink_global_scale: torch.Tensor | None = None,
+        logical_to_physical_map: torch.Tensor | None = None,
     ):
         super().__init__()
 
@@ -366,6 +368,19 @@ class TopK(torch.nn.Module):
             assert correction_bias is not None
             assert sink_global_scale is not None
             assert routed_scaling_factor is not None
+        if logical_to_physical_map is not None and (
+            logical_to_physical_map.ndim != 1
+            or logical_to_physical_map.dtype != torch.int32
+            or not logical_to_physical_map.is_contiguous()
+        ):
+            raise ValueError(
+                "logical_to_physical_map must be a contiguous rank-1 INT32 tensor"
+            )
+        self.register_buffer(
+            "logical_to_physical_map",
+            logical_to_physical_map,
+            persistent=False,
+        )
 
         self.topk_config = TopKConfig(
             top_k=top_k,
@@ -383,6 +398,7 @@ class TopK(torch.nn.Module):
             topk_weights_dtype=topk_weights_dtype,
             num_sink_experts=num_sink_experts,
             sink_global_scale=sink_global_scale,
+            logical_to_physical_map=self.logical_to_physical_map,
         )
 
     def forward(
@@ -393,6 +409,9 @@ class TopK(torch.nn.Module):
         num_token_non_padded: torch.Tensor | None = None,
         expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
     ) -> TopKOutput:
+        # Keep the dataclass reference current if ``Module._apply`` moved the
+        # registered map buffer to another device after construction.
+        self.topk_config.logical_to_physical_map = self.logical_to_physical_map
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         else:
@@ -504,11 +523,18 @@ def select_experts(
             )
         else:
             mapped_in_kernel = False
-            logical_to_physical_map = None
+            logical_to_physical_map = topk_config.logical_to_physical_map
+            if logical_to_physical_map is not None:
+                mapped_in_kernel = True
             if (
                 expert_location_dispatch_info is not None
                 and expert_location_dispatch_info.ep_dispatch_algorithm == "static"
             ):
+                if logical_to_physical_map is not None:
+                    raise ValueError(
+                        "TopK received both a static logical map and expert "
+                        "location dispatch metadata"
+                    )
                 logical_to_physical_map = (
                     expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
                 )
@@ -530,6 +556,7 @@ def select_experts(
                     top_k,
                     routed_scaling_factor=float(routed_scaling_factor),
                     normalize_topk_weights=renormalize,
+                    logical_to_physical_map=logical_to_physical_map,
                 )
             else:
                 topk_weights, topk_ids = minimax_biased_grouped_topk(
