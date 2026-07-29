@@ -43,25 +43,28 @@ def _attn_res_reference(
     ).to(torch.bfloat16)
 
 
-def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
+@pytest.mark.parametrize("hidden", [4096, 7168, 8192])
+def test_attn_res_public_block_major_dispatch_matches_reference(
+    hidden: int,
+) -> None:
     tokens, valid_blocks = 256, 8
     generator = torch.Generator(device="cuda").manual_seed(91)
     layer = torch.randn(
-        tokens, 7168, device="cuda", dtype=torch.bfloat16, generator=generator
+        tokens, hidden, device="cuda", dtype=torch.bfloat16, generator=generator
     )
     history = torch.randn(
         valid_blocks,
         tokens,
-        7168,
+        hidden,
         device="cuda",
         dtype=torch.bfloat16,
         generator=generator,
     )
     res_weight = torch.randn(
-        7168, device="cuda", dtype=torch.bfloat16, generator=generator
+        hidden, device="cuda", dtype=torch.bfloat16, generator=generator
     )
-    score_weight = torch.randn(7168, device="cuda", generator=generator)
-    output_weight = torch.randn(7168, device="cuda", generator=generator)
+    score_weight = torch.randn(hidden, device="cuda", generator=generator)
+    output_weight = torch.randn(hidden, device="cuda", generator=generator)
 
     actual = attn_res_fwd(
         layer,

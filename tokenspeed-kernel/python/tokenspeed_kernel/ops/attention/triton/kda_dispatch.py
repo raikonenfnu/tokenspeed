@@ -222,6 +222,82 @@ def triton_nvidia_kda_fused_paged_decode(
 
 @register_kernel(
     "attention",
+    "kda_fused_paged_decode",
+    name="triton_amd_kda_fused_paged_decode",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=_DENSE_HALF_SIGNATURES,
+    priority=Priority.PERFORMANT,
+    traits={"flat_state": frozenset({True})},
+    tags={"amd", "flat_kv", "cuda_graph", "fused"},
+)
+def triton_amd_kda_fused_paged_decode(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    cu_seqlens: torch.Tensor,
+    lower_bound: float | None,
+) -> torch.Tensor | None:
+    """Fuse KDA's decode convolution, projection, and indexed recurrence."""
+    if (
+        tuple(mixed_qkv.shape) != (1, 4608)
+        or tuple(conv_weights.shape) != (4608, 4)
+        or conv_states.ndim != 3
+        or tuple(conv_states.shape[1:]) != (4608, 3)
+        or tuple(f_a_out.shape) != (1, 128)
+        or tuple(f_b_weight.shape) != (1536, 128)
+        or tuple(beta_logits.shape) != (1, 12)
+        or tuple(A_log.shape) != (12,)
+        or tuple(dt_bias.shape) not in {(12, 128), (1536,)}
+        or state_pool.ndim != 4
+        or tuple(state_pool.shape[1:]) != (12, 128, 128)
+        or tuple(read_indices.shape) != (1,)
+        or tuple(write_indices.shape) != (1,)
+        or tuple(cu_seqlens.shape) != (2,)
+        or num_heads != 12
+        or head_dim != 128
+    ):
+        return None
+
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_recurrent_kda_megafuse,
+    )
+
+    out = fused_recurrent_kda_megafuse(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        h_pool=state_pool,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        cu_seqlens=cu_seqlens,
+        lower_bound=lower_bound,
+        state_vk_layout=True,
+        clamp_gate=True,
+    )
+    return out.view(1, -1, num_heads, head_dim)
+
+
+@register_kernel(
+    "attention",
     "kda_fused_paged_verify",
     name="triton_nvidia_kda_fused_paged_verify",
     solution="triton",

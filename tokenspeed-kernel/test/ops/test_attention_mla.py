@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 from tokenspeed_kernel import (
+    mla_decode_projected_value,
     mla_decode_with_kvcache,
     mla_prefill,
 )
@@ -348,3 +349,161 @@ def test_mla_decode_with_kvcache(
     out_tol = 1e-1 if q_dtype in _FP8_DTYPES or kv_dtype in _FP8_DTYPES else 8e-2
     torch.testing.assert_close(out.float(), out_ref, rtol=out_tol, atol=out_tol)
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
+
+
+def test_mla_decode_projected_value_matches_split_and_captures(
+    device: str,
+) -> None:
+    if not platform.is_cdna4:
+        pytest.skip("K3 fused MLA epilogue requires CDNA4")
+    from tokenspeed_kernel import mla_project_value
+
+    torch.manual_seed(67)
+    q = torch.randn(1, 1, 12, 576, device=device, dtype=torch.bfloat16).to(
+        platform.fp8e4m3fn.dtype
+    )
+    kv_cache = torch.randn(64, 64, 1, 576, device=device, dtype=torch.bfloat16).to(
+        platform.fp8e4m3fn.dtype
+    )
+    page_table = torch.arange(64, device=device, dtype=torch.int32).view(1, 64)
+    cache_seqlens = torch.tensor([4096], device=device, dtype=torch.int32)
+    weight = torch.randn(12, 512, 128, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(1, 1536, device=device, dtype=torch.bfloat16)
+    output = torch.empty_like(gate)
+    attention = mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=8192,
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0 / math.sqrt(192),
+        solution="gluon",
+    )
+    expected = mla_project_value(
+        attention.reshape(1, 12, 512),
+        weight,
+        gate=gate,
+    )
+
+    mla_decode_projected_value(
+        q,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        8192,
+        128,
+        512,
+        64,
+        1.0 / math.sqrt(192),
+        weight,
+        gate=gate,
+        out=output,
+    )
+    eager_output = output.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        returned = mla_decode_projected_value(
+            q,
+            kv_cache,
+            page_table,
+            cache_seqlens,
+            8192,
+            128,
+            512,
+            64,
+            1.0 / math.sqrt(192),
+            weight,
+            gate=gate,
+            out=output,
+        )
+    assert returned.data_ptr() == output.data_ptr()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, eager_output, atol=0, rtol=0)
+    # The fused path retains opt69's 16-split schedule, while the generic
+    # native-FP8 path uses 64 splits. Validate the resulting FP8 reduction
+    # against the generic composition within its quantized numerical envelope.
+    torch.testing.assert_close(output, expected, atol=0.125, rtol=0.05)
+
+
+@pytest.mark.parametrize("use_gate", [False, True])
+def test_mla_decode_projected_value_composes_split_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    use_gate: bool,
+) -> None:
+    import tokenspeed_kernel.ops.attention as attention_ops
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    latent = torch.arange(24, dtype=torch.float32).reshape(2, 1, 3, 4) / 16
+    q = torch.empty(2, 1, 3, 6)
+    kv_cache = torch.empty(1, 8, 1, 6)
+    page_table = torch.zeros(2, 1, dtype=torch.int32)
+    cache_seqlens = torch.ones(2, dtype=torch.int32)
+    weight = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2) / 32
+    raw_gate = torch.linspace(-1, 1, 12).reshape(2, 6)
+    gate = raw_gate if use_gate else None
+    output = torch.empty_like(raw_gate)
+
+    def no_fused_kernel(*args, **kwargs):
+        raise NoKernelFoundError
+
+    def split_decode(**kwargs):
+        assert kwargs["kv_lora_rank"] == 4
+        assert kwargs["qk_rope_head_dim"] == 2
+        return latent
+
+    monkeypatch.setattr(attention_ops, "select_kernel", no_fused_kernel)
+    monkeypatch.setattr(attention_ops, "mla_decode_with_kvcache", split_decode)
+
+    returned = attention_ops.mla_decode_projected_value(
+        q,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        8,
+        2,
+        4,
+        2,
+        1.0,
+        weight,
+        gate=gate,
+        out=output,
+    )
+    expected = torch.bmm(
+        latent.reshape(2, 3, 4).transpose(0, 1).contiguous(),
+        weight,
+    )
+    expected = expected.transpose(0, 1).reshape_as(output)
+    if gate is not None:
+        expected = expected * torch.sigmoid(gate)
+    assert returned.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(output, expected)
+
+
+def test_gfx950_k3_decode_split_policy() -> None:
+    """Bound K3's 16K-capacity BF16-Q decode without changing long contexts."""
+    if not current_platform().is_cdna4:
+        pytest.skip("K3 FP8 MLA split policy targets CDNA4")
+    from tokenspeed_kernel_amd.ops.attention.gluon.mla_decode_gfx950 import (
+        _select_num_kv_splits_bh16bn128,
+    )
+
+    assert (
+        _select_num_kv_splits_bh16bn128(
+            batch=1,
+            max_seqlen_k=16_384,
+            block_n=128,
+        )
+        == 16
+    )
+    assert (
+        _select_num_kv_splits_bh16bn128(
+            batch=1,
+            max_seqlen_k=300_000,
+            block_n=128,
+        )
+        == 128
+    )

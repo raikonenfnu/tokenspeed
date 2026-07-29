@@ -530,6 +530,8 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
     BV: tl.constexpr,
     stride_state_page: tl.constexpr,
     stride_conv_page: tl.constexpr,
+    STATE_VK_LAYOUT: tl.constexpr,
+    CLAMP_GATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
@@ -651,7 +653,12 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
             tl.float32
         )
         b_g = b_g + b_bias
-    if USE_LOWER_BOUND:
+    if CLAMP_GATE:
+        b_softplus = tl.where(b_g < 20.0, tl.math.log(1 + tl.math.exp(b_g)), b_g)
+        b_gk = -tl.exp(b_A) * b_softplus
+        if USE_LOWER_BOUND:
+            b_gk = tl.maximum(b_gk, lower_bound)
+    elif USE_LOWER_BOUND:
         b_gk = lower_bound * tl.sigmoid(tl.exp(b_A) * b_g)
     else:
         b_gk = -tl.exp(b_A) * tl.where(
@@ -659,13 +666,22 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
         )
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    p_h0 = (
-        h_pool
-        + b_read * stride_state_page
-        + i_hv * K * V
-        + o_k[:, None] * V
-        + o_v[None, :]
-    )
+    if STATE_VK_LAYOUT:
+        p_h0 = (
+            h_pool
+            + b_read * stride_state_page
+            + i_hv * V * K
+            + o_v[None, :] * K
+            + o_k[:, None]
+        )
+    else:
+        p_h0 = (
+            h_pool
+            + b_read * stride_state_page
+            + i_hv * K * V
+            + o_k[:, None] * V
+            + o_v[None, :]
+        )
     b_h += tl.load(p_h0, mask=mask_h & read_ok, other=0.0).to(tl.float32)
 
     b_h *= tl.exp(b_gk[:, None])
@@ -680,13 +696,22 @@ def fused_recurrent_kda_megafuse_fwd_kernel(
         b_o.to(o.dtype.element_ty),
         mask=mask_v,
     )
-    p_ht = (
-        h_pool
-        + b_write * stride_state_page
-        + i_hv * K * V
-        + o_k[:, None] * V
-        + o_v[None, :]
-    )
+    if STATE_VK_LAYOUT:
+        p_ht = (
+            h_pool
+            + b_write * stride_state_page
+            + i_hv * V * K
+            + o_v[None, :] * K
+            + o_k[:, None]
+        )
+    else:
+        p_ht = (
+            h_pool
+            + b_write * stride_state_page
+            + i_hv * K * V
+            + o_k[:, None] * V
+            + o_v[None, :]
+        )
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h & (b_write >= 0))
 
 
@@ -1005,6 +1030,10 @@ def fused_recurrent_kda_megafuse(
     scale: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
     lower_bound: float | None = None,
+    state_vk_layout: bool = False,
+    clamp_gate: bool = False,
+    block_v: int = 16,
+    num_warps: int = 2,
 ) -> torch.Tensor:
     """Single-step KDA decode with conv1d(+silu) and the f_b gate GEMV fused in.
 
@@ -1016,6 +1045,12 @@ def fused_recurrent_kda_megafuse(
         beta: ``[T, HV]`` raw logits (sigmoid in-kernel).
         h_pool / read_indices / write_indices: as in the pool kernel.
         num_heads/head_dim: per-rank head geometry (P = num_heads*head_dim).
+        state_vk_layout: Address each state head as ``[V, K]`` instead of the
+            vendored FLA ``[K, V]`` layout.
+        clamp_gate: Use ``max(-exp(A) * softplus(g), lower_bound)`` to match
+            TokenSpeed's AMD KDA recurrence.
+        block_v: Value-axis tile used by the recurrent state update.
+        num_warps: Number of waves assigned to each value tile.
 
     Returns:
         o: ``[T, HV, V]`` attention output (bf16).
@@ -1030,7 +1065,11 @@ def fused_recurrent_kda_megafuse(
     assert qkv_raw.stride(-1) == 1 and conv_w.is_contiguous() and w_fb.is_contiguous()
     N = T if cu_seqlens is None else len(cu_seqlens) - 1
     out = torch.empty(T, HV, V, dtype=qkv_raw.dtype, device=qkv_raw.device)
-    BV = 32
+    if block_v not in (16, 32, 64, 128):
+        raise ValueError("KDA megafuse block_v must be one of 16, 32, 64, or 128")
+    if num_warps not in (2, 4, 8):
+        raise ValueError("KDA megafuse num_warps must be one of 2, 4, or 8")
+    BV = block_v
     grid = (triton.cdiv(V, BV) * N * HV,)
     fused_recurrent_kda_megafuse_fwd_kernel[grid](
         qkv_raw=qkv_raw,
@@ -1063,7 +1102,9 @@ def fused_recurrent_kda_megafuse(
         BV=BV,
         stride_state_page=h_pool.stride(0),
         stride_conv_page=conv_pool.stride(0),
-        num_warps=4,
+        STATE_VK_LAYOUT=state_vk_layout,
+        CLAMP_GATE=clamp_gate,
+        num_warps=num_warps,
         num_stages=2,
     )
     return out
