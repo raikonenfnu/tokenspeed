@@ -431,9 +431,11 @@ def _attention_use_fp4_indexer_cache(server_args: "ServerArgs", hf_config) -> bo
 def _resolve_kda_backend(kda_backend: str) -> str:
     """Resolve the KDA prefill backend policy to a concrete choice.
 
-    ``auto`` picks the fastest available kernel — ``cutedsl_kda`` (the tokenspeed-cutedsl-kda AOT build
-    matching this device), then ``flashkda`` (optional source-built package),
-    falling back to the portable FLA scan. ``fla`` forces the portable scan.
+    On AMD, ``auto`` remains capability-based so tokenspeed-kernel can select
+    the best registered architecture specialization. On NVIDIA it picks
+    ``cutedsl_kda`` (the tokenspeed-cutedsl-kda AOT build matching this
+    device), then ``flashkda`` (optional source-built package), falling back to
+    the portable FLA scan. ``fla`` forces the portable scan.
     Explicit choices are validated against availability and fail fast with an
     install hint instead of silently mis-routing. Decode is unaffected either
     way.
@@ -442,6 +444,9 @@ def _resolve_kda_backend(kda_backend: str) -> str:
     from tokenspeed_kernel.ops.attention.flash_kda import is_flash_kda_installed
 
     if kda_backend == "auto":
+        if current_platform().is_amd:
+            logger.info("KDA prefill backend uses capability-based kernel selection")
+            return "auto"
         if is_cutedsl_kda_installed():
             resolved = "cutedsl_kda"
         elif is_flash_kda_installed():

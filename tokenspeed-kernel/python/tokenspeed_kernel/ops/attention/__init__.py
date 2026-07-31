@@ -803,10 +803,6 @@ def kda_paged_prefill(
         raise ValueError(
             "KDA initial_state inner [heads, key_dim, value_dim] must be contiguous"
         )
-    # AMD historically ignores the NVIDIA prefill policy labels and uses its
-    # registered Triton implementation.
-    if current_platform().is_amd and solution in {"fla", "flashkda", "cutedsl_kda"}:
-        solution = "triton"
     kernel = select_kernel(
         "attention",
         "kda_paged_prefill",

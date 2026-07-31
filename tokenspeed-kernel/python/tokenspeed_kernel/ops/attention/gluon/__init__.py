@@ -54,6 +54,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.attention.gluon.kda_decode_gfx950 import (
         kda_recurrent_decode_gfx950 as _kda_decode_impl,
     )
+    from tokenspeed_kernel_amd.ops.attention.gluon.kda_prefill_gfx950 import (
+        kda_chunk_prefill_gfx950 as _kda_prefill_impl,
+    )
     from tokenspeed_kernel_amd.ops.attention.gluon.mha_decode_gfx950 import (
         gluon_mha_decode_gfx950 as _decode_impl,
     )
@@ -116,6 +119,31 @@ if current_platform().is_amd:
     def gluon_kda_paged_decode_gfx950(**kwargs):
         """Run specialized gfx950 KDA decode against the canonical K-major pool."""
         return _kda_decode_impl(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "kda_paged_prefill",
+        name="gluon_kda_paged_prefill_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k", "v"),
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        priority=Priority.SPECIALIZED,
+        tags={"amd", "gfx950", "flat_kv"},
+    )
+    def gluon_kda_paged_prefill_gfx950(**kwargs):
+        """Run gfx950 KDA prefill with the canonical K-major state ABI."""
+        from tokenspeed_kernel.ops.attention.kda_utils import KdaPrefillResult
+
+        output, final_state = _kda_prefill_impl(**kwargs)
+        return KdaPrefillResult(output, final_state)
 
     @register_kernel(
         "attention",

@@ -217,10 +217,10 @@ def _nvidia_kda_prefill(
     "kda_paged_prefill",
     name="triton_kda_paged_prefill",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.PERFORMANT,
-    tags={"amd", "nvidia", "flat_kv"},
+    tags={"nvidia", "flat_kv"},
 )
 def triton_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     from tokenspeed_kernel.ops.attention.triton.linear.kda import (

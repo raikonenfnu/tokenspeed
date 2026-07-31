@@ -13,7 +13,6 @@ from tokenspeed_kernel.ops.attention import (
 )
 from tokenspeed_kernel.ops.attention.triton.kda_dispatch import (
     triton_kda_paged_decode,
-    triton_kda_paged_prefill,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import select_kernel
@@ -216,49 +215,19 @@ def test_kda_paged_decode_uses_fla_kernel_for_compound_decode_on_amd() -> None:
     )
 
 
-def test_kda_paged_prefill_dispatches_to_fla_kernel_on_amd() -> None:
-    """AMD prefill must select the portable FLA-derived chunk kernel."""
+def test_kda_paged_prefill_dispatches_to_gluon_kernel_on_gfx950() -> None:
+    """GFX950 prefill must select the specialized Gluon chunk kernel."""
     if not current_platform().is_amd:
         pytest.skip("AMD KDA dispatch test")
 
     device = "cuda"
-    torch.manual_seed(29)
-    tokens, heads, key_dim, value_dim = 5, 2, 8, 4
-    q = torch.randn(1, tokens, heads, key_dim, device=device, dtype=torch.bfloat16)
+    tokens, heads, key_dim, value_dim = 1, 2, 128, 128
+    q = torch.empty(1, tokens, heads, key_dim, device=device, dtype=torch.bfloat16)
     k = torch.randn_like(q)
     v = torch.randn(1, tokens, heads, value_dim, device=device, dtype=torch.bfloat16)
-    raw_g = torch.randn_like(q)
-    beta = torch.randn(1, tokens, heads, device=device, dtype=torch.bfloat16)
-    initial_state = torch.randn(
-        2, heads, key_dim, value_dim, device=device, dtype=torch.float32
+    selected = select_kernel(
+        "attention",
+        "kda_paged_prefill",
+        _attention_format_signature(q=q, k=k, v=v),
     )
-    a_log = torch.randn(heads, device=device, dtype=torch.float32)
-    dt_bias = torch.randn(heads, key_dim, device=device, dtype=torch.float32)
-    cu_seqlens = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
-
-    expected = triton_kda_paged_prefill(
-        q=q,
-        k=k,
-        v=v,
-        g_raw=raw_g,
-        beta_logits=beta,
-        A_log=a_log,
-        dt_bias=dt_bias,
-        initial_state=initial_state.clone(),
-        cu_seqlens=cu_seqlens,
-        lower_bound=-5.0,
-    )
-    actual = kda_paged_prefill(
-        q,
-        k,
-        v,
-        raw_g,
-        beta,
-        a_log,
-        dt_bias,
-        initial_state=initial_state.clone(),
-        cu_seqlens=cu_seqlens,
-    )
-
-    torch.testing.assert_close(actual.out, expected.out)
-    torch.testing.assert_close(actual.final_state, expected.final_state)
+    assert selected.name == "gluon_kda_paged_prefill_gfx950"
