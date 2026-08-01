@@ -35,8 +35,6 @@ server:
     --trust-remote-code
     --sampling-backend triton
     --seed 42
-    --force-deterministic-rsag
-    --no-enable-prefix-caching
     --disable-kvstore
     --kvstore-ratio 0.0
     --enable-cache-report
@@ -53,14 +51,20 @@ eval:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.9.1'
   command: >-
-    /tmp/evalscope-perf/bin/evalscope eval
+    curl -fsS
+    --retry 10
+    --retry-connrefused
+    --retry-delay 1
+    -X POST
+    http://127.0.0.1:8001/flush_cache
+    && /tmp/evalscope-perf/bin/evalscope eval
     --model kimi-k3
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets aime26
     --eval-batch-size 16
     --stream
-    --generation-config '{"do_sample":true,"temperature":1.0,"seed":42,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
+    --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"seed":42,"max_tokens":32768,"extra_body":{"reasoning_effort":"high"}}'
 report:
   github_step_summary: true
 # Measured 0.933 (28/30) on 8x MI350X with high reasoning effort.
