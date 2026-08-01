@@ -198,6 +198,17 @@ Notes:
   a warning when it adjusts); the page grain is budget-dependent (e.g. 1472
   at 32k context, 1536 at 1M), so do not hand-tune the chunk size against a
   hard-coded page value. Prefix hits are page-granular.
+- For reproducible stochastic reasoning, use the Triton sampler, set a server
+  seed, send the same request seed, and pass `--force-deterministic-rsag` on
+  AMD. The greedy backend always takes `argmax` and therefore ignores request
+  temperature; on long reasoning traces that can turn near-tie perturbations
+  into repetition loops. The deterministic flag routes collectives through
+  NCCL, removing the symmetric-memory reduction as a source of run-to-run
+  variation at some collective-performance cost. It does not make logits
+  invariant to request packing. For isolated evaluations,
+  `--no-enable-prefix-caching` prevents an eval retry from taking a different
+  cached-prefill path. It does not change the FlatKV scheduler or active-request
+  KV caching.
 
 ### NVIDIA
 
@@ -240,6 +251,13 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --enable-expert-parallel \
   --attention-backend mla \
   --moe-backend auto \
+  --sampling-backend triton \
+  --seed 42 \
+  --force-deterministic-rsag \
+  --max-cudagraph-capture-size 16 \
+  --cudagraph-capture-sizes 1 2 4 8 16 \
+  --disable-prefill-graph \
+  --no-enable-prefix-caching \
   --gpu-memory-utilization 0.92 \
   --max-num-seqs 32 \
   --disable-kvstore \
