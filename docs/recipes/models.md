@@ -181,6 +181,11 @@ Notes:
   longer required.
 - The checkpoint carries no fp8 KV scaling factors; the loader defaults them
   to 1.0 (a warning at load). Expect a small accuracy delta vs bf16 KV.
+- On ROCm, K3 checkpoint tensors are staged through transient pageable CPU
+  allocations before their device copy. This avoids repeatedly registering the
+  checkpoint's thousands of `safetensors` mmap views. Keep this staging memory
+  pageable: pinning every staged allocation can make the first RCCL collective
+  after loading hang.
 - The vision encoder has 12 attention heads. For an 8-way text TP deployment,
   use `--mm-encoder-tp-mode data` so each rank runs the vision encoder at TP1
   on a different whole image.

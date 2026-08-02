@@ -103,6 +103,24 @@ def _vision_checkpoint_weights(model):
     return loaded, expected
 
 
+def test_stage_checkpoint_weight_clones_cpu_weight_for_accelerator(monkeypatch):
+    weight = torch.ones(2)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    staged = kimi_k3._stage_checkpoint_weight(weight)
+
+    assert staged is not weight
+    torch.testing.assert_close(staged, weight)
+    assert not staged.is_pinned()
+
+
+def test_stage_checkpoint_weight_is_noop_without_accelerator(monkeypatch):
+    weight = torch.ones(2)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    assert kimi_k3._stage_checkpoint_weight(weight) is weight
+
+
 def test_kimi_k3_factory_wires_real_vision_item_dp(monkeypatch):
     mapping = _item_dp_mapping()
     model = _build_model(monkeypatch, mapping)
