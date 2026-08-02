@@ -1025,6 +1025,8 @@ class CudaGraphWrapper:
         return self._padded_bs(bs, ctx)
 
     def _padded_bs(self, bs: int, ctx: ForwardContext) -> int:
+        if ctx.stable_graph_padding and not self.disable_padding:
+            return self.max_bs
         graph_bs = self._global_graph_bs(ctx)
         target_bs = graph_bs if graph_bs is not None else bs
         index = bisect.bisect_left(self.capture_bs, target_bs)

@@ -331,3 +331,45 @@ def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
     _finish(scheduler, "a")
     scheduler.next_execution_plan()
     assert scheduler.available_kv_pages() == before
+
+
+def test_reset_prefix_cache_turns_repeated_prompt_hit_into_miss() -> None:
+    config = _make_config()
+    config.disable_prefix_cache = False
+    scheduler = ts.Scheduler(config)
+    tokens = list(range(1, 9))
+
+    scheduler.submit_requests([_spec("populate", tokens)])
+    assert _find_flat_op(scheduler.next_execution_plan()) is not None
+    _advance_tokens(scheduler, "populate", [9001])
+    assert _find_flat_op(scheduler.next_execution_plan()) is not None
+    _advance_tokens(scheduler, "populate", [9002])
+    _finish(scheduler, "populate")
+    scheduler.next_execution_plan()
+
+    scheduler.submit_requests([_spec("hit", tokens)])
+    hit = _find_flat_op(scheduler.next_execution_plan())
+    assert hit is not None
+    assert hit.input_lengths[0] < len(tokens)
+    assert _find_flat_op(scheduler.next_execution_plan()) is not None
+    _advance_tokens(scheduler, "hit", [9001])
+    scheduler.next_execution_plan()
+    _advance_tokens(scheduler, "hit", [9002])
+    _finish(scheduler, "hit")
+    scheduler.next_execution_plan()
+
+    scheduler.reset_prefix_cache()
+
+    scheduler.submit_requests([_spec("miss", tokens)])
+    miss = _find_flat_op(scheduler.next_execution_plan())
+    assert miss is not None
+    assert miss.input_lengths[0] == len(tokens)
+    assert miss.extend_prefix_lens[0] == 0
+
+
+def test_reset_prefix_cache_rejects_active_request() -> None:
+    scheduler = ts.Scheduler(_make_k3_config())
+    scheduler.submit_requests([_spec("active", [1, 2, 3, 4])])
+
+    with pytest.raises(RuntimeError, match="requests are active"):
+        scheduler.reset_prefix_cache()

@@ -196,6 +196,27 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
     return events;
 }
 
+void Scheduler::ResetPrefixCache() {
+    _assert(requests_.empty(), "cannot reset prefix cache while requests are active");
+    _assert(pending_forward_results_.empty(), "cannot reset prefix cache with pending forward results");
+    _assert(cache_op_tracker_.empty(), "cannot reset prefix cache with cache operations in flight");
+    _assert(deferred_aborts_.empty(), "cannot reset prefix cache with deferred aborts");
+#if TOKENSPEED_FLAT_KVCACHE
+    _assert(flat_store_ops_.Empty(), "cannot reset prefix cache with flat stores in flight");
+    _assert(flat_load_ops_.empty(), "cannot reset prefix cache with flat loads in flight");
+    _assert(coordinator_.ResetCache(), "cannot reset flat prefix cache while blocks are pinned");
+#endif
+
+    // The radix cache also owns hybrid adjunct state (Mamba and paged-cache
+    // snapshots). Its eviction callbacks release those resources as the tree
+    // is pruned. On FlatKV builds this is normally empty, but resetting both
+    // boundaries keeps the public operation complete.
+    _assert(kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(device_allocator_.TotalPages() - 1),
+            "cannot reset device prefix cache while pages are pinned");
+    _assert(kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(host_allocator_.TotalPages() - 1),
+            "cannot reset host prefix cache while pages are pinned");
+}
+
 std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32_t>& input_tokens, bool apply_match) {
     const std::int32_t block_size = config_.block_size;
     const std::size_t num_pages = input_tokens.size() / block_size;

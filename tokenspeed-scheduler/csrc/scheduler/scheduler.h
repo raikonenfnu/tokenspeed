@@ -69,6 +69,7 @@ public:
 
     void Advance(const ExecutionEvent& event);
     std::vector<KvCacheEvent> DrainKvEvents();
+    void ResetPrefixCache();
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;

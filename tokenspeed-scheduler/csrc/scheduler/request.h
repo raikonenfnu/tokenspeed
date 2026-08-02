@@ -54,6 +54,11 @@ public:
 
     std::string Id() const { return id_; }
 
+    // Immutable model-input key used to keep packed batch rows stable across
+    // retries. Request IDs are frontend-generated and therefore unsuitable as
+    // a numerical scheduling tie-breaker.
+    const std::vector<std::int32_t>& SchedulingKey() const { return scheduling_key_; }
+
     // The wrapper lambda converts any concrete state type returned by event's operator()
     // into fsm::State, allowing operator() to return specific state types instead of State.
     template <typename Event>
@@ -374,6 +379,7 @@ public:
 
 private:
     std::string id_;
+    std::vector<std::int32_t> scheduling_key_;
     TokenContainer token_container_;
     std::int32_t page_size_;
     fsm::State state_;

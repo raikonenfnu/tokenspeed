@@ -32,6 +32,7 @@ Covers:
 
 import pytest
 from tokenspeed_scheduler import (
+    FLAT_KVCACHE,
     Cache,
     ExecutionEvent,
     ExecutionPlan,
@@ -99,6 +100,41 @@ def get_forward_op(plan: ExecutionPlan):
 
 
 class TestFSMTransitions:
+    def test_batch_order_uses_immutable_input_tokens_not_request_ids(self):
+        """Random frontend IDs must not permute otherwise identical eval waves."""
+        if FLAT_KVCACHE:
+            from conftest import _make_k3_config
+
+            config = _make_k3_config()
+        else:
+            config = make_config()
+        s = Scheduler(config)
+        specs = [
+            make_spec("id-a", [30, 1]),
+            make_spec("id-z", [10, 1]),
+            make_spec("id-m", [20, 1]),
+        ]
+        s.submit_requests(specs)
+
+        prefill = get_forward_op(s.next_execution_plan())
+        assert prefill.request_ids == ["id-z", "id-m", "id-a"]
+
+        first_decode = get_forward_op(s.next_execution_plan())
+        assert first_decode.request_ids == ["id-z", "id-m", "id-a"]
+
+        # The key is the original prompt, not the generated token container.
+        # Appending outputs that would reverse a mutable-token ordering must
+        # not change packed decode rows.
+        for request_id, output_token in (
+            ("id-z", 99),
+            ("id-m", 50),
+            ("id-a", 0),
+        ):
+            advance_forward(s, request_id, [output_token])
+            send_reserve_num_tokens(s, request_id, 0)
+        decode = get_forward_op(s.next_execution_plan())
+        assert decode.request_ids == ["id-z", "id-m", "id-a"]
+
     def test_invalid_transition_reports_event_and_state(self):
         s = Scheduler(make_config())
         submit(s, "r0", list(range(4)))

@@ -137,6 +137,29 @@ def test_cuda_graph_wrapper_uses_existing_route_for_padding():
     assert wrapper.padded_bs(30, ctx) == 32
 
 
+def test_seeded_decode_keeps_max_graph_bucket_as_batch_shrinks():
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.disable = False
+    wrapper.dp_size = 1
+    wrapper.disable_padding = False
+    wrapper.max_bs = 16
+    wrapper.capture_bs = [1, 2, 4, 8, 16]
+    wrapper.graphs = {1, 2, 4, 8, 16}
+    wrapper.max_tokens_per_req = 1
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=3,
+        num_extends=0,
+        input_num_tokens=3,
+        forward_mode=ForwardMode.DECODE,
+        stable_graph_padding=True,
+    )
+
+    assert wrapper.can_run(3, ctx)
+    assert wrapper.padded_bs(3, ctx) == 16
+
+
 def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
     wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
     wrapper.config = SimpleNamespace(max_req_pool_size=21)

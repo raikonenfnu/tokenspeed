@@ -222,6 +222,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             self._logit_bias[pool_idx, token_ids] = bias_values
 
     def reset_capture_state(self) -> None:
+        super().reset_capture_state()
         self._counts[0].fill_(0)
 
     @nvtx_range("sampling:penalties", color="yellow")
@@ -450,11 +451,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             sampling_info.req_pool_indices, logits.shape[0]
         )
         logits = self._apply_penalties_and_bias(logits, req_pool_indices)
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._sampling_offset_pool
         sampled = self._gumbel_sample_full_logits(
             logits,
             req_pool_indices,
@@ -475,6 +472,10 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             req_pool_indices,
             sampled,
             torch.ones_like(sampled, dtype=torch.int32),
+        )
+        self._advance_sampling_offsets(
+            req_pool_indices,
+            self._ones_buf[: logits.shape[0]],
         )
 
         return sampled, self._ones_buf[: logits.shape[0]]
@@ -520,11 +521,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             num_tokens_per_req=num_tokens_per_req,
         )
 
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._sampling_offset_pool
         target_sampled = self._gumbel_sample_full_logits(
             logits,
             req_pool_indices,
@@ -544,6 +541,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         accept_length += 1
 
         self.maybe_broadcast(predict, accept_index, accept_length)
+        self._advance_sampling_offsets(req_pool_indices, accept_length)
 
         valid = accept_index >= 0
         safe_positions = accept_index.clamp(min=0).long()

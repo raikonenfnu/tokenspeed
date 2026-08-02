@@ -21,9 +21,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 import zmq
@@ -83,6 +85,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# SMG tokenizes one eval wave concurrently, but the first short prompt can
+# reach the scheduler well ahead of its siblings.  K3 has deliberately
+# different M=1 and M>1 decode projection kernels, so admitting a nominal
+# batch-16 wave as 1+15 changes its numerical path.  Wait for a genuinely
+# quiet tokenizer interval while retaining a hard latency bound for isolated
+# seeded requests.
+_SEEDED_BURST_QUIET_SECONDS = 0.250
+_SEEDED_BURST_CAP_SECONDS = 1.000
+
 
 def _profile_rank_tag(attn_mapping) -> str:
     """File-name tag identifying this scheduler process's profile outputs."""
@@ -114,6 +125,7 @@ class RequestHandler:
         pause_controller=None,
         memory_controller=None,
         model_runner=None,
+        flush_cache_fn: Callable[[], bool] | None = None,
     ) -> None:
 
         self.forward_ct = 0
@@ -126,6 +138,7 @@ class RequestHandler:
         # ModelRunner for in-place RL weight sync (NCCL group init + receive).
         # The scheduler worker passes it in; None elsewhere (e.g. unit tests).
         self.model_runner = model_runner
+        self.flush_cache_fn = flush_cache_fn
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -174,6 +187,55 @@ class RequestHandler:
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_req)
+
+            # Frontends tokenize concurrent requests independently. Without a
+            # bounded drain, the scheduler may consume the first few seeded
+            # requests while their siblings are still crossing ZMQ, changing
+            # both prefill packing and the numerical path between repeats.
+            is_seeded_generate_burst = recv_reqs and all(
+                isinstance(req, TokenizedGenerateReqInput)
+                and req.sampling_params.seed is not None
+                for req in recv_reqs
+            )
+            if is_seeded_generate_burst:
+                started = time.monotonic()
+                cap_deadline = started + _SEEDED_BURST_CAP_SECONDS
+                quiet_deadline = min(
+                    started + _SEEDED_BURST_QUIET_SECONDS, cap_deadline
+                )
+                while True:
+                    now = time.monotonic()
+                    if now >= quiet_deadline:
+                        break
+                    timeout_ms = max(1, math.ceil((quiet_deadline - now) * 1000))
+                    if not self.recv_func.poll(timeout_ms, zmq.POLLIN):
+                        break
+
+                    received_more = False
+                    while True:
+                        try:
+                            recv_req = self.recv_func.recv_pyobj(zmq.NOBLOCK)
+                        except zmq.ZMQError:
+                            break
+                        recv_reqs.append(recv_req)
+                        received_more = True
+
+                    if not received_more:
+                        break
+                    quiet_deadline = min(
+                        time.monotonic() + _SEEDED_BURST_QUIET_SECONDS,
+                        cap_deadline,
+                    )
+
+                # gRPC coroutine timing can also permute packed rows. A stable
+                # model-input order makes repeated seeded batches follow the
+                # same kernels with the same row assignment.
+                if all(
+                    isinstance(req, TokenizedGenerateReqInput)
+                    and req.sampling_params.seed is not None
+                    for req in recv_reqs
+                ):
+                    recv_reqs.sort(key=lambda req: req.input_ids)
         else:
             recv_reqs = None
 
@@ -210,9 +272,13 @@ class RequestHandler:
                 logger.debug("AbortReq for rid=%s", recv_req.rid)
                 abort_rids.append(recv_req.rid)
             elif isinstance(recv_req, FlushCacheReqInput):
-                # Prefix cache is owned by the scheduler path; acknowledge the
-                # control request here so API callers still get a typed reply.
-                self.send_func.send_pyobj(FlushCacheReqOutput(success=True))
+                success = False
+                try:
+                    if self.flush_cache_fn is not None:
+                        success = bool(self.flush_cache_fn())
+                except RuntimeError as exc:
+                    logger.warning("Prefix-cache flush rejected: %s", exc)
+                self.send_func.send_pyobj(FlushCacheReqOutput(success=success))
             elif isinstance(recv_req, PauseSchedulerReqInput):
                 # State change + reply (abort/wait replies are deferred by the
                 # controller until the event loop observes a drained scheduler).

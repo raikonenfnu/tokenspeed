@@ -119,6 +119,13 @@ class TritonSamplingBackend(SamplingBackend):
         self._seed_pool = torch.zeros(
             (pool_rows,), dtype=torch.int64, device=config.device
         )
+        # This is the position in the request's sampling stream, not its KV
+        # sequence length.  KV length depends on how much of the prompt was
+        # served by prefix cache and therefore cannot be used as a reproducible
+        # Philox offset.
+        self._sampling_offset_pool = torch.zeros(
+            (pool_rows,), dtype=torch.int64, device=config.device
+        )
 
         self._ones_buf = torch.ones(
             (config.max_bs,), dtype=torch.int32, device=config.device
@@ -329,6 +336,21 @@ class TritonSamplingBackend(SamplingBackend):
         self._top_k_pool[pool_idx].fill_(int(sp.top_k))
         self._top_p_pool[pool_idx].fill_(float(sp.top_p))
         self._seed_pool[pool_idx].fill_(int(sp.seed))
+        self._sampling_offset_pool[pool_idx].fill_(0)
+
+    def _advance_sampling_offsets(
+        self, req_pool_indices: torch.Tensor, increments: torch.Tensor
+    ) -> None:
+        """Advance per-request RNG positions by committed output tokens."""
+        self._sampling_offset_pool.index_add_(
+            0,
+            req_pool_indices.long(),
+            increments.to(torch.int64),
+        )
+
+    def reset_capture_state(self) -> None:
+        # Graph warm-up uses pool row zero and may execute the captured update.
+        self._sampling_offset_pool[0].fill_(0)
 
     def prepare_step(
         self,
@@ -443,11 +465,7 @@ class TritonSamplingBackend(SamplingBackend):
         if sampling_info.is_all_greedy:
             batch_next_token_ids = cute_argmax(logits)
         else:
-            offsets_pool = (
-                sampling_info.valid_cache_lengths
-                if sampling_info.valid_cache_lengths is not None
-                else self._zero_offsets_pool
-            )
+            offsets_pool = self._sampling_offset_pool
             bs = logits.shape[0]
             req_pool_indices = self._req_pool_indices_for_kernels(
                 sampling_info.req_pool_indices, bs
@@ -531,6 +549,9 @@ class TritonSamplingBackend(SamplingBackend):
         sampled = batch_next_token_ids.to(torch.int32)
         self.maybe_broadcast(sampled)
 
+        if not sampling_info.is_all_greedy:
+            self._advance_sampling_offsets(req_pool_indices, self._ones_buf[:bs])
+
         self._write_logprob_outputs(logits_output, logits, sampled)
 
         return sampled, self._ones_buf[: logits.shape[0]]
@@ -574,11 +595,7 @@ class TritonSamplingBackend(SamplingBackend):
                 enable_pdl=pdl_enabled(),
             )
         else:
-            offsets_pool = (
-                sampling_info.valid_cache_lengths
-                if sampling_info.valid_cache_lengths is not None
-                else self._zero_offsets_pool
-            )
+            offsets_pool = self._sampling_offset_pool
             req_pool_indices = self._req_pool_indices_for_kernels(
                 sampling_info.req_pool_indices, bs
             )
@@ -693,6 +710,9 @@ class TritonSamplingBackend(SamplingBackend):
 
         # Rank 0 remains the source of truth for attention-TP agreement.
         self.maybe_broadcast(predict, accept_index, accept_length)
+
+        if not sampling_info.is_all_greedy:
+            self._advance_sampling_offsets(req_pool_indices, accept_length)
 
         if self.config.enable_output_logprobs:
             self._write_logprob_outputs(

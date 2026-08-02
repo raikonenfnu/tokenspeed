@@ -53,6 +53,9 @@ class ForwardContext:
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None
+    # Explicitly seeded decode keeps one captured graph shape as peers finish,
+    # preventing batch-size kernel changes from perturbing its logits.
+    stable_graph_padding: bool = False
 
     # --- dp attention ---
     global_num_tokens: list[int] | None = None
