@@ -157,6 +157,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _stage_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """Copy mmap-backed CPU weights before transferring them to an accelerator.
+
+    On ROCm, copying thousands of distinct safetensors mmap views directly to a
+    GPU can repeatedly enter the HMM/SVM range-registration path.  A transient
+    pageable allocation is reusable by the CPU allocator and avoids registering
+    every checkpoint mapping.  Do not pin the copy: retaining a model's worth of
+    registered host allocations can interfere with later GPU collectives.
+    """
+    if loaded_weight.device.type == "cpu" and torch.cuda.is_available():
+        return loaded_weight.clone()
+    return loaded_weight
+
+
 # ===----------------------------------------------------------------------=== #
 # Multimodal vision path
 # ===----------------------------------------------------------------------=== #
@@ -1806,11 +1820,13 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 if mapped not in params_dict:
                     continue
                 param = params_dict[mapped]
-                param.weight_loader(param, loaded_weight, shard_id)
+                param.weight_loader(
+                    param, _stage_checkpoint_weight(loaded_weight), shard_id
+                )
                 break
             else:
                 if moe_loader.matches(name):
-                    moe_loader.load(name, loaded_weight)
+                    moe_loader.load(name, _stage_checkpoint_weight(loaded_weight))
                     continue
 
                 if fuse_qkv_a_proj and ".g_proj" in name:
@@ -1830,7 +1846,11 @@ class KimiLinearForCausalLM(BaseCausalLM):
                         gate_rows = loaded_weight.shape[0] // self.mapping.attn.tp_size
                         gate_start = self.mapping.attn.tp_rank * gate_rows
                         gate_shard = loaded_weight[gate_start : gate_start + gate_rows]
-                        param.weight_loader(param, gate_shard, begin_size=gate_offset)
+                        param.weight_loader(
+                            param,
+                            _stage_checkpoint_weight(gate_shard),
+                            begin_size=gate_offset,
+                        )
                         continue
 
                 if fuse_qkv_a_proj and (
@@ -1851,14 +1871,18 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     param = params_dict.get(mapped)
                     if param is None:
                         continue
-                    param.weight_loader(param, loaded_weight, begin_size=begin_size)
+                    param.weight_loader(
+                        param,
+                        _stage_checkpoint_weight(loaded_weight),
+                        begin_size=begin_size,
+                    )
                     continue
 
                 param = params_dict.get(name)
                 if param is None:
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                weight_loader(param, _stage_checkpoint_weight(loaded_weight))
 
         self.post_load_weights()
 
@@ -2073,7 +2097,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
                         dropped_vision_weights += 1
                     else:
                         assert vision_params is not None
-                        self.vision.load_weight(name, weight, vision_params)
+                        self.vision.load_weight(
+                            name, _stage_checkpoint_weight(weight), vision_params
+                        )
                         loaded_vision_weights += 1
                     continue
                 if name.startswith("language_model."):
