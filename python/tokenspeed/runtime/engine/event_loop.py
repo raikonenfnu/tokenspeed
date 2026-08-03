@@ -601,6 +601,7 @@ class EventLoop:
             pause_controller=self._pause,
             memory_controller=self._memory,
             model_runner=target,
+            flush_cache_fn=self._flush_prefix_cache,
         )
 
         self.output_processor = OutputProcesser(
@@ -1701,6 +1702,11 @@ class EventLoop:
         reset = getattr(self.scheduler, "reset_prefix_cache", None)
         if callable(reset):
             reset()
+
+    def _flush_prefix_cache(self) -> bool:
+        """Synchronously invalidate scheduler-owned prefix state on every TP rank."""
+        self.scheduler.reset_prefix_cache()
+        return True
 
     def _kv_pools(self) -> list:
         """All KV pools whose pages are tagged ``kv_cache`` — the target pool and

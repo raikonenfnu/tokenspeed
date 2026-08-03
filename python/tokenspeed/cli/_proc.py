@@ -32,7 +32,7 @@ import time
 logger = logging.getLogger(__name__)
 
 _GATEWAY_MODULE = "smg"
-_ENGINE_MODULE_DEFAULT = "smg_grpc_servicer.tokenspeed"
+_ENGINE_MODULE_DEFAULT = "tokenspeed.cli.smg_engine"
 _PIPE_LINE_LIMIT = 64 * 1024 * 1024
 
 

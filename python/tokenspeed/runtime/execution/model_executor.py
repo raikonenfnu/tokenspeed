@@ -1932,6 +1932,11 @@ class ModelExecutor:
                     ),
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
+                    stable_graph_padding=(
+                        forward_mode.is_decode()
+                        and bool(sampling_params_list)
+                        and all(p.seed is not None for p in sampling_params_list)
+                    ),
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:

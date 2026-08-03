@@ -498,6 +498,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              nb::arg("request_specs"))
         .def("next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); })
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
+        .def("reset_prefix_cache", &tokenspeed::Scheduler::ResetPrefixCache)
         .def(
             "drain_kv_events",
             [](tokenspeed::Scheduler& s) {

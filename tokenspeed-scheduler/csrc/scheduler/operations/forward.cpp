@@ -1243,10 +1243,17 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         if (req->Is<fsm::Retracted>()) return 4;
         return 9;
     };
-    // TP-determinism: tie-break on Id() so every rank schedules the same subset (a rank-varying op deadlocks NCCL).
+    // TP-determinism: every rank must schedule the same subset or collectives
+    // deadlock. Frontend-generated request IDs are random, however, so using
+    // them as the primary tie-breaker also permutes packed model rows between
+    // identical seeded eval waves. Order by the immutable input tokens first;
+    // identical prompts are numerically interchangeable and retain Id() as a
+    // total-order fallback.
     std::sort(candidates.begin(), candidates.end(), [&](const auto& a, const auto& b) {
         int pa = priority(a), pb = priority(b);
-        return pa != pb ? pa < pb : a->Id() < b->Id();
+        if (pa != pb) return pa < pb;
+        if (a->SchedulingKey() != b->SchedulingKey()) return a->SchedulingKey() < b->SchedulingKey();
+        return a->Id() < b->Id();
     });
 
 #if TOKENSPEED_FLAT_KVCACHE
