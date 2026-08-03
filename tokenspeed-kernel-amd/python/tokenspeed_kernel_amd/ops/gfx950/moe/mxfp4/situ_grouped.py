@@ -808,25 +808,18 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         num_warps=s1_warps,
     )
 
-    # Atomic combine wins in decode, where only a handful of local routes
-    # contend.  Prefill retains deterministic BF16 partials + one FP32 masked
-    # reduction; measurements show atomics lose once thousands of tokens hit
-    # the same output surface.
-    fuse_combine = num_tokens <= 16
-    if fuse_combine:
-        stage2_out = torch.zeros(
-            (num_tokens, hidden_dim),
-            dtype=torch.float32,
-            device=hidden_states.device,
-        )
-        stage2_strides = (stage2_out.stride(0), 0, stage2_out.stride(1))
-    else:
-        stage2_out = torch.empty(
-            (num_tokens, top_k, hidden_dim),
-            dtype=torch.bfloat16,
-            device=hidden_states.device,
-        )
-        stage2_strides = stage2_out.stride()
+    # Keep one race-free partial per (token, route) and reduce slots in a fixed
+    # order below. The previous M<=16 fast path atomically accumulated routes
+    # into one output row; CTA arrival order then changed K3 decode logits
+    # between otherwise identical seeded runs. Tiny M<=8 is already handled by
+    # the deterministic route-direct kernel before reaching this grouped path.
+    fuse_combine = False
+    stage2_out = torch.empty(
+        (num_tokens, top_k, hidden_dim),
+        dtype=torch.bfloat16,
+        device=hidden_states.device,
+    )
+    stage2_strides = stage2_out.stride()
     s2_block_n = 128
     s2_block_k = 64
     s2_warps = 4
@@ -863,9 +856,6 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
         FUSE_COMBINE=fuse_combine,
         num_warps=s2_warps,
     )
-    if fuse_combine:
-        return stage2_out.to(torch.bfloat16)
-
     out = torch.empty(
         (num_tokens, hidden_dim),
         dtype=torch.bfloat16,

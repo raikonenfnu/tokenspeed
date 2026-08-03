@@ -20,6 +20,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E402
     gluon_a16w4_situ_warp_decode_ep_gfx950,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_grouped import (  # noqa: E402
+    gluon_a16w4_situ_grouped_ep_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
     preprocess_gluon_mxfp4_gfx950_moe_weights,
 )
@@ -276,3 +279,71 @@ def test_static_fp8_activation_moe() -> None:
     torch.cuda.synchronize()
     assert actual.shape == hidden_states.shape
     torch.testing.assert_close(actual, torch.zeros_like(actual), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [5, 8, 16])
+def test_grouped_decode_is_bit_exact_across_repeated_launches(
+    num_tokens: int,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("Grouped MXFP4 SiTU MoE requires an AMD GPU")
+    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    if "gfx950" not in arch:
+        pytest.skip("Grouped MXFP4 SiTU MoE is unavailable on this GPU")
+
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    num_experts, top_k = 48, 8
+    hidden_size, intermediate_size = 256, 256
+
+    hidden_states = torch.randn(
+        (num_tokens, hidden_size), dtype=torch.bfloat16, device=device
+    )
+    w13_weight = torch.randint(
+        0,
+        256,
+        (num_experts, 2 * intermediate_size, hidden_size // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    w13_scale = torch.full(
+        (num_experts, 2 * intermediate_size, hidden_size // 32),
+        127,
+        dtype=torch.uint8,
+        device=device,
+    )
+    w2_weight = torch.randint(
+        0,
+        256,
+        (num_experts, hidden_size, intermediate_size // 2),
+        dtype=torch.uint8,
+        device=device,
+    )
+    w2_scale = torch.full(
+        (num_experts, hidden_size, intermediate_size // 32),
+        127,
+        dtype=torch.uint8,
+        device=device,
+    )
+    topk_ids = torch.stack(
+        [torch.randperm(num_experts, device=device)[:top_k] for _ in range(num_tokens)]
+    ).to(torch.int32)
+    topk_weights = torch.rand((num_tokens, top_k), dtype=torch.float32, device=device)
+    topk_weights /= topk_weights.sum(dim=1, keepdim=True)
+
+    def run() -> torch.Tensor:
+        return gluon_a16w4_situ_grouped_ep_gfx950(
+            hidden_states,
+            w13_weight,
+            w13_scale,
+            w2_weight,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            situ_beta=1.0,
+            situ_linear_beta=None,
+        ).clone()
+
+    expected = run()
+    for _ in range(100):
+        torch.testing.assert_close(run(), expected, rtol=0, atol=0)

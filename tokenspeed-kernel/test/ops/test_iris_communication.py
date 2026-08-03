@@ -80,9 +80,12 @@ def _ar_shape_cases() -> List[Tuple[int, ...]]:
     ]
 
 
-def _ar_two_shape_case() -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
-    """Production Kimi K3 shared-output and routed-latent decode widths."""
-    return (1, 7168), (1, 3584)
+def _ar_two_shape_cases() -> List[Tuple[Tuple[int, ...], Tuple[int, ...]]]:
+    """Kimi K3 specialized batch-1 and generic batch-16 decode shapes."""
+    return [
+        ((1, 7168), (1, 3584)),
+        ((16, 7168), (16, 3584)),
+    ]
 
 
 def _ar_worker_fn(rank, world_size, port, error_dict):
@@ -110,11 +113,13 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         # process (which has no distributed context).
         from tokenspeed_kernel.ops.communication.iris import create_iris_state
 
-        first_shape, second_shape = _ar_two_shape_case()
         max_numel = max(
             max(int(torch.tensor(s).prod()) for s in _ar_shape_cases()),
-            int(torch.tensor(first_shape).prod())
-            + int(torch.tensor(second_shape).prod()),
+            max(
+                int(torch.tensor(first_shape).prod())
+                + int(torch.tensor(second_shape).prod())
+                for first_shape, second_shape in _ar_two_shape_cases()
+            ),
         )
         state = create_iris_state(
             group=dist.group.WORLD,
@@ -124,14 +129,17 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         )
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
-        _check_all_reduce_two(
-            state,
-            rank,
-            world_size,
-            first_shape,
-            second_shape,
-            device,
-        )
+        for first_shape, second_shape in _ar_two_shape_cases():
+            _check_all_reduce_two(
+                state,
+                rank,
+                world_size,
+                first_shape,
+                second_shape,
+                device,
+            )
+        if world_size == 8:
+            _check_all_reduce_residual_rmsnorm(rank, world_size, device)
     finally:
         dist.destroy_process_group()
 
@@ -162,7 +170,10 @@ def _check_all_reduce_two(
     second_shape,
     device,
 ) -> None:
-    from tokenspeed_kernel.ops.communication.iris import iris_all_reduce_two
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_all_reduce,
+        iris_all_reduce_two,
+    )
 
     first = torch.full(
         first_shape,
@@ -192,6 +203,165 @@ def _check_all_reduce_two(
         atol=0,
         rtol=0,
     )
+
+    # Alternate the production collectives through one symmetric buffer, as
+    # K3 does across attention and joint shared/routed MoE reductions.
+    interleaved = torch.empty(first_shape, dtype=torch.bfloat16, device=device)
+    for epoch in range(16):
+        interleaved.fill_((epoch + 3) * (rank + 1))
+        interleaved_result = iris_all_reduce(state, interleaved)
+        torch.testing.assert_close(
+            interleaved_result,
+            torch.full_like(interleaved, (epoch + 3) * expected_value),
+            atol=0,
+            rtol=0,
+        )
+        first.fill_((epoch + 1) * (rank + 1))
+        second.fill_((epoch + 2) * (rank + 1))
+        first_result, second_result = iris_all_reduce_two(state, first, second)
+        torch.testing.assert_close(
+            first_result,
+            torch.full_like(first, (epoch + 1) * expected_value),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            second_result,
+            torch.full_like(second, (epoch + 2) * expected_value),
+            atol=0,
+            rtol=0,
+        )
+
+    # Capture both collectives in one graph. Replaying a lone collective does
+    # not reproduce the cross-epoch buffer reuse that K3 exercises.
+    graph = torch.cuda.CUDAGraph()
+    dist.barrier()
+    with torch.cuda.graph(graph):
+        graph_interleaved = iris_all_reduce(state, interleaved)
+        graph_first, graph_second = iris_all_reduce_two(state, first, second)
+    torch.cuda.synchronize()
+    dist.barrier()
+    for epoch in range(16):
+        interleaved.fill_((epoch + 7) * (rank + 1))
+        first.fill_((epoch + 17) * (rank + 1))
+        second.fill_((epoch + 33) * (rank + 1))
+        graph.replay()
+        torch.cuda.synchronize()
+
+        def reduced_value(multiplier: int) -> float:
+            return (
+                torch.tensor(
+                    [multiplier * (peer + 1) for peer in range(world_size)],
+                    dtype=torch.bfloat16,
+                )
+                .float()
+                .sum()
+                .to(torch.bfloat16)
+                .item()
+            )
+
+        torch.testing.assert_close(
+            graph_interleaved,
+            torch.full_like(graph_interleaved, reduced_value(epoch + 7)),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            graph_first,
+            torch.full_like(graph_first, reduced_value(epoch + 17)),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            graph_second,
+            torch.full_like(graph_second, reduced_value(epoch + 33)),
+            atol=0,
+            rtol=0,
+        )
+
+
+def _check_all_reduce_residual_rmsnorm(
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    """Stress K3 decode's fused attention collective at production width."""
+    from tokenspeed_kernel.ops.communication.iris import (
+        create_iris_ar_rmsnorm_state,
+        iris_allreduce_residual_rmsnorm,
+    )
+
+    tokens, hidden = 16, 7168
+    state = create_iris_ar_rmsnorm_state(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        max_token_num=tokens,
+        hidden_dim=hidden,
+        dtype=torch.bfloat16,
+    )
+    generator = torch.Generator(device=device).manual_seed(1234)
+    base = torch.randn(
+        (tokens, hidden),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    local = base * (rank + 1)
+    residual = torch.randn(
+        (tokens, hidden),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    weight = torch.randn(
+        (hidden,),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+
+    expected_norm, expected_residual = iris_allreduce_residual_rmsnorm(
+        state,
+        local,
+        residual,
+        weight,
+    )
+    for _ in range(16):
+        norm, residual_out = iris_allreduce_residual_rmsnorm(
+            state,
+            local,
+            residual,
+            weight,
+        )
+        torch.testing.assert_close(norm, expected_norm, atol=0, rtol=0)
+        torch.testing.assert_close(
+            residual_out,
+            expected_residual,
+            atol=0,
+            rtol=0,
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    dist.barrier()
+    with torch.cuda.graph(graph):
+        graph_norm, graph_residual = iris_allreduce_residual_rmsnorm(
+            state,
+            local,
+            residual,
+            weight,
+        )
+    torch.cuda.synchronize()
+    dist.barrier()
+    for _ in range(16):
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_norm, expected_norm, atol=0, rtol=0)
+        torch.testing.assert_close(
+            graph_residual,
+            expected_residual,
+            atol=0,
+            rtol=0,
+        )
 
 
 def _run_ar_test(world_size: int) -> None:

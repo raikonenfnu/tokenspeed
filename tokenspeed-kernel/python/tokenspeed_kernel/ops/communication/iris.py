@@ -342,7 +342,7 @@ class IrisAllReduce(object):
             all_reduce_distribution=1,
         )
 
-        # Heap holds two flat buffers of ``max_numel * itemsize`` plus iris
+        # Heap holds the flat input buffer plus epoch arrays and Iris
         # bookkeeping; we leave generous headroom (~16 MiB) for internal
         # workspaces such as ring/spinlock flags.
         if heap_size is None:
@@ -356,6 +356,13 @@ class IrisAllReduce(object):
         self._block_size = 2048
         self._max_blocks = triton.cdiv(max_numel, self._block_size)
         self._ready_flags = self._ctx.zeros(
+            (self._max_blocks, self.world_size), dtype=torch.int32
+        )
+        # A second epoch array closes the producer/consumer handshake. Without
+        # it, a fast rank can begin the next collective and overwrite its
+        # symmetric input buffer while a slower peer still reads the previous
+        # epoch.
+        self._done_flags = self._ctx.zeros(
             (self._max_blocks, self.world_size), dtype=torch.int32
         )
         self._heap_base_addresses = tuple(
@@ -403,6 +410,7 @@ class IrisAllReduce(object):
             in_view.view(-1),
             tensor.view(-1),
             self._ready_flags,
+            self._done_flags,
             self._ctx.get_heap_bases(),
             numel,
             RANK=self._iris_rank,
@@ -478,6 +486,7 @@ class IrisAllReduce(object):
                 first.view(-1),
                 second.view(-1),
                 self._ready_flags,
+                self._done_flags,
                 *self._heap_base_addresses,
                 first_numel,
                 total_numel,
@@ -494,6 +503,7 @@ class IrisAllReduce(object):
                 first.view(-1),
                 second.view(-1),
                 self._ready_flags,
+                self._done_flags,
                 self._ctx.get_heap_bases(),
                 first_numel,
                 total_numel,
@@ -514,6 +524,7 @@ def iris_stage_one_shot_allreduce_kernel(
     input_sym_ptr,
     output_ptr,
     ready_flags,
+    done_flags,
     heap_bases,
     NUMEL,
     RANK: tl.constexpr,
@@ -556,9 +567,30 @@ def iris_stage_one_shot_allreduce_kernel(
                 heap_bases,
                 mask=mask,
                 other=0.0,
-                cache_modifier=".cg",
+                # The same symmetric address is reused every graph epoch.
+                # Bypass stale remote L2 lines after the ready flag advances.
+                cache_modifier=".cv",
                 hint=BLOCK_SIZE,
             ).to(tl.float32)
+
+    # Do not let any rank reuse its symmetric input buffer until every peer has
+    # consumed this block. Stream ordering then makes one buffer sufficient
+    # across consecutive graph replays.
+    tl.debug_barrier()
+    local_done = done_flags + flag_offset + RANK
+    tl.atomic_xchg(local_done, epoch, sem="release", scope="sys")
+    for peer in tl.static_range(0, WORLD_SIZE):
+        if peer != RANK:
+            seen = tl.full((), 0, dtype=tl.int32)
+            while seen < epoch:
+                seen = iris.load(
+                    done_flags + flag_offset + peer,
+                    RANK,
+                    peer,
+                    heap_bases,
+                    cache_modifier=".cv",
+                    volatile=True,
+                )
     tl.store(output_ptr + offsets, acc.to(output_ptr.type.element_ty), mask=mask)
 
 
@@ -669,6 +701,7 @@ def iris_stage_one_shot_allreduce_two_gluon_kernel(
     first_output_ptr,
     second_output_ptr,
     ready_flags,
+    done_flags,
     heap_base_0,
     heap_base_1,
     heap_base_2,
@@ -774,13 +807,34 @@ def iris_stage_one_shot_allreduce_two_gluon_kernel(
                 packed_offset.to(gl.int32),
                 mask=packed_offset < total_packed,
                 other=0,
-                cache=".cg",
+                # Peer payload changes in place on every graph replay.
+                cache=".cv",
             )
             peer_0, peer_1, peer_2, peer_3 = _unpack_bf16x4(peer_packed)
             acc_0 += peer_0
             acc_1 += peer_1
             acc_2 += peer_2
             acc_3 += peer_3
+
+    gl.barrier()
+    local_done = done_flags + flag_offset + RANK
+    gl.atomic_xchg(local_done, epoch, sem="release", scope="sys")
+    _iris_wait_for_peers(
+        done_flags,
+        block_id,
+        epoch,
+        local_heap,
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+        RANK,
+        WORLD_SIZE,
+    )
 
     packed_output = _pack_bf16x4(acc_0, acc_1, acc_2, acc_3)
     gl.amd.cdna4.buffer_store(
@@ -805,6 +859,7 @@ def iris_stage_one_shot_allreduce_two_kernel(
     first_output_ptr,
     second_output_ptr,
     ready_flags,
+    done_flags,
     heap_bases,
     FIRST_NUMEL,
     TOTAL_NUMEL,
@@ -867,9 +922,25 @@ def iris_stage_one_shot_allreduce_two_kernel(
                 heap_bases,
                 mask=combined_mask,
                 other=0.0,
-                cache_modifier=".cg",
+                cache_modifier=".cv",
                 hint=BLOCK_SIZE,
             ).to(tl.float32)
+
+    tl.debug_barrier()
+    local_done = done_flags + flag_offset + RANK
+    tl.atomic_xchg(local_done, epoch, sem="release", scope="sys")
+    for peer in tl.static_range(0, WORLD_SIZE):
+        if peer != RANK:
+            seen = tl.full((), 0, dtype=tl.int32)
+            while seen < epoch:
+                seen = iris.load(
+                    done_flags + flag_offset + peer,
+                    RANK,
+                    peer,
+                    heap_bases,
+                    cache_modifier=".cv",
+                    volatile=True,
+                )
 
     acc = acc.to(first_output_ptr.type.element_ty)
     tl.store(first_output_ptr + combined_offsets, acc, mask=first_mask)
@@ -902,6 +973,7 @@ def iris_allreduce_kernel(
             heap_bases,
             mask=mask,
             other=0.0,
+            cache_modifier=".cv",
         ).to(tl.float32)
 
     out_dtype = output_ptr.type.element_ty
@@ -944,6 +1016,7 @@ def iris_allreduce_residual_rmsnorm_kernel(
             heap_bases,
             mask=mask,
             other=0.0,
+            cache_modifier=".cv",
         ).to(tl.float32)
 
     residual = tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
@@ -1010,6 +1083,7 @@ def iris_allreduce_residual_rmsnorm_kernel_persistent(
                 heap_bases,
                 mask=mask,
                 other=0.0,
+                cache_modifier=".cv",
             ).to(tl.float32)
 
         residual = tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(
