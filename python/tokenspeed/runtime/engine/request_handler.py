@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 import zmq
@@ -114,6 +114,7 @@ class RequestHandler:
         pause_controller=None,
         memory_controller=None,
         model_runner=None,
+        flush_cache_fn: Callable[[], bool] | None = None,
     ) -> None:
 
         self.forward_ct = 0
@@ -126,6 +127,7 @@ class RequestHandler:
         # ModelRunner for in-place RL weight sync (NCCL group init + receive).
         # The scheduler worker passes it in; None elsewhere (e.g. unit tests).
         self.model_runner = model_runner
+        self.flush_cache_fn = flush_cache_fn
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -210,9 +212,13 @@ class RequestHandler:
                 logger.debug("AbortReq for rid=%s", recv_req.rid)
                 abort_rids.append(recv_req.rid)
             elif isinstance(recv_req, FlushCacheReqInput):
-                # Prefix cache is owned by the scheduler path; acknowledge the
-                # control request here so API callers still get a typed reply.
-                self.send_func.send_pyobj(FlushCacheReqOutput(success=True))
+                success = False
+                try:
+                    if self.flush_cache_fn is not None:
+                        success = bool(self.flush_cache_fn())
+                except RuntimeError as exc:
+                    logger.warning("Prefix-cache flush rejected: %s", exc)
+                self.send_func.send_pyobj(FlushCacheReqOutput(success=success))
             elif isinstance(recv_req, PauseSchedulerReqInput):
                 # State change + reply (abort/wait replies are deferred by the
                 # controller until the event loop observes a drained scheduler).

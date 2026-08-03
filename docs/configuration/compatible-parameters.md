@@ -63,3 +63,27 @@ TokenSpeed-specific behavior explicitly.
 - Review `--max-num-batched-tokens` before copying it. TokenSpeed usually wants `--chunked-prefill-size` for per-iteration scheduling.
 - Review backend names. TokenSpeed backends are optimized for its runtime and kernel packages.
 - Keep TokenSpeed-specific `--attn-tp-size`, `--moe-tp-size`, `--disaggregation-*`, and `--kvstore-*` only when the deployment needs those features.
+
+## Seeded Sampling
+
+OpenAI-compatible generation requests may provide `seed`. The TokenSpeed SMG
+adapter preserves a seed carried in the protobuf extension fields. The SMG
+version currently pinned by TokenSpeed does not yet serialize the OpenAI seed;
+when that field is absent, the adapter falls back to a configured server
+`--seed`. An explicit extension-field seed takes precedence, and deployments
+that do not configure `--seed` retain request-ID-derived sampling.
+
+The Triton sampling backend advances the seed by the number of output tokens
+committed for the request. Prompt length, prefix-cache hits, request-pool
+placement, and decode batch shape therefore do not change the random draw
+sequence for a fixed seed.
+
+`/flush_cache` invalidates the scheduler-owned FlatKV and radix/hybrid prefix
+caches before acknowledging success. The scheduler must be drained; a flush
+requested while model or cache-transfer work is active is rejected rather than
+reporting a false success. This ensures cache-flushed evaluation repeats start
+from the same prefill state.
+
+The SMG health RPC uses a scheduler load round-trip rather than generating a
+token. Health monitoring therefore cannot enter the inference batch, change
+its graph padding, or perturb the logits of live requests.

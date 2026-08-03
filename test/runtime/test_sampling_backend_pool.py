@@ -214,6 +214,41 @@ class TestTritonRouteSelection(unittest.TestCase):
     def setUp(self):
         self.backend = TritonSamplingBackend(_make_config())
 
+    def test_sampling_offset_tracks_output_tokens_and_resets_on_slot_flip(self):
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[2],
+            sampling_params_list=[_sp("a", seed=42)],
+        )
+        self.assertEqual(self.backend._sampling_offset_pool[2].item(), 0)
+
+        self.backend._advance_sampling_offsets(
+            torch.tensor([2], dtype=torch.int32, device="cuda"),
+            torch.tensor([3], dtype=torch.int32, device="cuda"),
+        )
+        self.assertEqual(self.backend._sampling_offset_pool[2].item(), 3)
+
+        # A continuing request keeps its output-token position.
+        self.backend.prepare_step(
+            request_ids=["a"],
+            request_pool_indices=[2],
+            sampling_params_list=[_sp("a", seed=42)],
+        )
+        self.assertEqual(self.backend._sampling_offset_pool[2].item(), 3)
+
+        # A new request reusing the pool slot starts from its own seed at zero.
+        self.backend.prepare_step(
+            request_ids=["b"],
+            request_pool_indices=[2],
+            sampling_params_list=[_sp("b", seed=42)],
+        )
+        self.assertEqual(self.backend._sampling_offset_pool[2].item(), 0)
+
+    def test_capture_reset_clears_warmup_sampling_offset(self):
+        self.backend._sampling_offset_pool[0].fill_(7)
+        self.backend.reset_capture_state()
+        self.assertEqual(self.backend._sampling_offset_pool[0].item(), 0)
+
     def test_no_filter_step_selects_triton_gumbel(self):
         self.backend.prepare_step(
             request_ids=["a", "b"],

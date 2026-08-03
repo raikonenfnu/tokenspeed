@@ -336,6 +336,34 @@ void KvCacheCoordinator::Free(std::span<BlockTable> tables) {
     }
 }
 
+bool KvCacheCoordinator::ResetCache() {
+    // Pending host stores pin their source blocks even before an operation is
+    // emitted. A flush is only valid on a drained scheduler, so release those
+    // provisional pins before walking the cache indexes.
+    pending_stores_.clear();
+
+    const auto reset_pool = [&](BlockPool& pool) {
+        for (CacheGroup& group : groups_) {
+            KvCacheManager& manager = group.Manager();
+            for (CacheBlockLocation location : manager.EvictableBlockLocations(pool)) {
+                manager.EvictCachedBlock(pool, location);
+            }
+        }
+    };
+    reset_pool(pool_);
+    if (host_pool_ != nullptr) {
+        reset_pool(*host_pool_);
+    }
+
+    const bool device_empty = pool_.NumOccupiedSlots() == 0;
+    const bool host_empty = host_pool_ == nullptr || host_pool_->NumOccupiedSlots() == 0;
+    if (device_empty && host_empty) {
+        next_access_epoch_ = 0;
+        return true;
+    }
+    return false;
+}
+
 bool KvCacheCoordinator::ContainsHostCachedBlock(const CacheKey& key) const {
     if (host_pool_ == nullptr) {
         return false;

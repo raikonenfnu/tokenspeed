@@ -62,10 +62,9 @@ class SamplingBatchInfo:
     req_pool_indices: torch.Tensor | None = None
 
     # int32[pool_rows] — RuntimeStates.valid_cache_lengths, read-only
-    # reference. Sampling backends derive the per-request Philox offset
-    # from `valid_cache_lengths.index_select(0, req_pool_indices)`;
-    # carrying the reference rather than the gathered view keeps the
-    # index_select inside the captured graph.
+    # reference. Backends may use this for sequence-position-dependent work;
+    # seeded samplers keep a separate output-token offset so prefix-cache state
+    # cannot change the random stream.
     valid_cache_lengths: torch.Tensor | None = None
 
     # Device

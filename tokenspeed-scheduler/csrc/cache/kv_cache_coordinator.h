@@ -109,6 +109,11 @@ public:
     void ConsumeAvailable(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
 
+    // Drop every unpinned device/host cache entry. Returns false if a live
+    // request or transfer still pins a block, in which case callers must wait
+    // for the scheduler to drain before retrying.
+    bool ResetCache();
+
     struct StoreCandidate {
         CacheKey key;
         CacheBlockRef block_ref;  // pinned until WriteBackDone or a drain-time drop releases the ref
