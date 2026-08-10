@@ -464,7 +464,7 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
 def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     num_tokens: int,
 ) -> None:

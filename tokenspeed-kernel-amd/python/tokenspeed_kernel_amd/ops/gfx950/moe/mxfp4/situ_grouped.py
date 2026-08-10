@@ -811,7 +811,7 @@ def gluon_a16w4_situ_grouped_ep_gfx950(
     # Keep one race-free partial per (token, route) and reduce slots in a fixed
     # order below. The previous M<=16 fast path atomically accumulated routes
     # into one output row; CTA arrival order then changed K3 decode logits
-    # between otherwise identical seeded runs. Tiny M<=8 is already handled by
+    # between otherwise identical seeded runs. Tiny M<=16 is already handled by
     # the deterministic route-direct kernel before reaching this grouped path.
     fuse_combine = False
     stage2_out = torch.empty(

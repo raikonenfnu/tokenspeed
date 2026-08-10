@@ -21,6 +21,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E4
     gluon_a16w4_situ_warp_decode_ep_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_grouped import (  # noqa: E402
+    _masked_topk_reduce_kernel,
     gluon_a16w4_situ_grouped_ep_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
@@ -347,3 +348,63 @@ def test_grouped_decode_is_bit_exact_across_repeated_launches(
     expected = run()
     for _ in range(100):
         torch.testing.assert_close(run(), expected, rtol=0, atol=0)
+
+
+def test_grouped_decode_reduces_slots_in_fixed_order() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("Grouped MXFP4 SiTU MoE requires an AMD GPU")
+    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    if "gfx950" not in arch:
+        pytest.skip("Grouped MXFP4 SiTU MoE is unavailable on this GPU")
+
+    device = torch.device("cuda")
+    num_tokens, top_k, hidden_size = 1, 3, 256
+    local_ids = torch.arange(top_k, dtype=torch.int32, device=device).view(1, top_k)
+    topk_weights = torch.ones((num_tokens, top_k), dtype=torch.float32, device=device)
+    terms = torch.tensor([2**24, 1, -(2**24)], dtype=torch.bfloat16, device=device)
+
+    def reduce(partials: torch.Tensor) -> torch.Tensor:
+        out = torch.empty(
+            (num_tokens, hidden_size), dtype=torch.bfloat16, device=device
+        )
+        _masked_topk_reduce_kernel[(1,)](
+            partials,
+            local_ids,
+            topk_weights,
+            out,
+            num_tokens,
+            hidden_size,
+            partials.stride(0),
+            partials.stride(1),
+            partials.stride(2),
+            local_ids.stride(0),
+            local_ids.stride(1),
+            topk_weights.stride(0),
+            topk_weights.stride(1),
+            out.stride(0),
+            out.stride(1),
+            TOP_K=top_k,
+            NUM_EXPERTS=top_k,
+            EXPERT_START=0,
+            BLOCK_M=64,
+            BLOCK_N=hidden_size,
+            num_warps=4,
+        )
+        return out
+
+    # FP32 slot order is observable here: ((2**24 + 1) - 2**24) rounds to
+    # zero, while ((2**24 - 2**24) + 1) is one.
+    ordered = terms.view(1, top_k, 1).expand(-1, -1, hidden_size).contiguous()
+    permuted = ordered[:, [0, 2, 1], :].contiguous()
+    torch.testing.assert_close(
+        reduce(ordered),
+        torch.zeros((num_tokens, hidden_size), dtype=torch.bfloat16, device=device),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        reduce(permuted),
+        torch.ones((num_tokens, hidden_size), dtype=torch.bfloat16, device=device),
+        rtol=0,
+        atol=0,
+    )

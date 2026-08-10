@@ -31,9 +31,10 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
-# TP8/EP8 model measurements favor warp GEMV through M=8 and grouped MFMA
-# above it.
-_ROUTE_DIRECT_DECODE_MAX_TOKENS = 8
+# With the deterministic grouped route reduction, production-shape TP8/EP8
+# measurements favor the token-owned warp GEMV through the largest captured
+# decode bucket. Larger batches retain grouped MFMA.
+_ROUTE_DIRECT_DECODE_MAX_TOKENS = 16
 
 
 if platform.is_amd:
