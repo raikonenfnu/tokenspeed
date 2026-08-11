@@ -386,7 +386,7 @@ def _launch_sigmoid_bias_topk_route_gluon(
     return topk_ids, topk_weights
 
 
-def invoke_sigmoid_bias_topk_route_gluon(
+def _invoke_sigmoid_bias_topk_route_gluon(
     router_logits: torch.Tensor,
     correction_bias: torch.Tensor,
     topk: int,
@@ -468,23 +468,36 @@ def _sigmoid_bias_topk_route_prefill_kernel(
     topk_lane = gl.arange(0, TKP, layout=topk_layout)
     selected_ids = gl.zeros([TKP], gl.int32, topk_layout)
     selected_weights = gl.zeros([TKP], gl.float32, topk_layout)
-    sentinel = gl.full([EP], E, gl.int32, expert_layout)
+    live = expert_mask
+    topmask = gl.full([EP], 0x80000000, gl.uint32, expert_layout)
+    fullmask = gl.full([EP], 0xFFFFFFFF, gl.uint32, expert_layout)
+    zero_pack = gl.full([EP], 0, gl.uint64, expert_layout)
+    score_raw = _route_score_to_u32_bits(scores, X_DTYPE)
+    zero_score_raw = gl.full([EP], 0, gl.uint32, expert_layout)
+    raw = choice.to(gl.uint32, bitcast=True)
+    value_key = raw ^ gl.where((raw & topmask) != 0, fullmask, topmask)
+    index_key = (EP - expert).to(gl.uint32)
+    packed_key = (value_key.to(gl.uint64) << 16) | index_key.to(gl.uint64)
     for rank in gl.static_range(TOPK):
-        maximum = gl.max(choice, axis=0)
-        selected = gl.min(
-            gl.where((choice == maximum) & expert_mask, expert, sentinel), axis=0
-        )
-        weight = gl.sum(gl.where(expert == selected, scores, 0.0), axis=0)
+        packed = gl.where(live, packed_key, zero_pack)
+        best = gl.max(packed, axis=0)
+        selected = (EP - (best & 0xFFFF).to(gl.int32)).to(gl.int32)
+        chosen = live & (expert == selected)
+        weight_raw = gl.sum(gl.where(chosen, score_raw, zero_score_raw), axis=0)
+        weight = _route_u32_bits_to_f32(weight_raw, X_DTYPE)
         selected_ids = gl.where(topk_lane == rank, selected, selected_ids)
         selected_weights = gl.where(topk_lane == rank, weight, selected_weights)
-        choice = gl.where(expert == selected, -float("inf"), choice)
+        live = live & (expert != selected)
 
     if NORMALIZE_TOPK_WEIGHTS:
         selected_weights = selected_weights.to(X_DTYPE)
-        denominator = gl.sum(selected_weights, axis=0)
-        denominator = gl.where(denominator != 0.0, denominator, 1.0)
-        selected_weights = selected_weights.to(gl.float32) * (
-            ROUTED_SCALING_FACTOR / denominator
+        denominator = gl.sum(selected_weights.to(gl.float32), axis=0).to(X_DTYPE)
+        normalized = gl.div_rn(
+            selected_weights.to(gl.float32), denominator.to(gl.float32)
+        ).to(X_DTYPE)
+        scale = gl.full([TKP], ROUTED_SCALING_FACTOR, gl.float32, topk_layout)
+        selected_weights = (
+            (normalized.to(gl.float32) * scale).to(X_DTYPE).to(gl.float32)
         )
 
     topk_mask = topk_lane < TOPK
@@ -557,6 +570,32 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
         num_warps=num_warps,
     )
     return topk_ids, topk_weights
+
+
+def invoke_sigmoid_bias_topk_route_gluon(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    *,
+    routed_scaling_factor: float = 1.0,
+    normalize_topk_weights: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use independent token CTAs when rows would serialize one decode CTA."""
+    if router_logits.shape[0] > 1:
+        return invoke_sigmoid_bias_topk_route_prefill_gluon(
+            router_logits,
+            correction_bias,
+            topk,
+            routed_scaling_factor=routed_scaling_factor,
+            normalize_topk_weights=normalize_topk_weights,
+        )
+    return _invoke_sigmoid_bias_topk_route_gluon(
+        router_logits,
+        correction_bias,
+        topk,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+    )
 
 
 __all__ = [

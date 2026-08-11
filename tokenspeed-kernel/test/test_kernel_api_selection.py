@@ -1751,6 +1751,18 @@ def test_triton_mxfp4_supports_input_activation_dtype(
     "ep_size,solution,kernel_name,preprocessor",
     [
         (
+            1,
+            None,
+            "gluon_mxfp4_a8w4_situ_precomputed_moe_apply",
+            "gluon_mxfp4_gfx950_moe_weights",
+        ),
+        (
+            1,
+            "gluon",
+            "gluon_mxfp4_a8w4_situ_precomputed_moe_apply",
+            "gluon_mxfp4_gfx950_moe_weights",
+        ),
+        (
             8,
             None,
             "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply",

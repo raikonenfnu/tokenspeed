@@ -389,6 +389,25 @@ def _swiglu_reduce(
 
 
 @gluon.jit
+def _situ_reduce(
+    acc,
+    beta: gl.constexpr,
+    linear_beta: gl.constexpr,
+    OUT_BLOCK_N: gl.constexpr,
+):
+    BLOCK_M: gl.constexpr = acc.shape[0]
+    BLOCK_N_FULL: gl.constexpr = acc.shape[1]
+    split_layout: gl.constexpr = _swiglu_split_layout(
+        BLOCK_M, BLOCK_N_FULL, gl.num_warps()
+    )
+    acc = gl.convert_layout(acc, split_layout).to(gl.bfloat16).to(gl.float32)
+    gate, linear = gl.split(acc.reshape((BLOCK_M, OUT_BLOCK_N, 2)))
+    gate = beta * gl.extra.libdevice.tanh(gate / beta) / (1.0 + gl.exp(-gate))
+    linear = linear_beta * gl.extra.libdevice.tanh(linear / linear_beta)
+    return gate * linear
+
+
+@gluon.jit
 def _mxfp4_quantize_tile(out):
     max_normal: gl.constexpr = 6.0
     min_normal: gl.constexpr = 1.0
@@ -7676,6 +7695,215 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     return out
 
 
+_SITU_INTERMEDIATE_SCALES: dict[tuple[torch.device, float], torch.Tensor] = {}
+
+
+def _situ_intermediate_scale(device: torch.device, max_abs: float) -> torch.Tensor:
+    key = (device, max_abs)
+    scale = _SITU_INTERMEDIATE_SCALES.get(key)
+    if scale is None:
+        scale = torch.tensor([max_abs / 448.0], dtype=torch.float32, device=device)
+        _SITU_INTERMEDIATE_SCALES[key] = scale
+    return scale
+
+
+def gluon_mxfp4_fp8_precomputed_situ(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_weight,
+    w2_weight,
+    *,
+    w13_mx_scale: torch.Tensor,
+    w2_mx_scale: torch.Tensor,
+    situ_beta: float,
+    situ_linear_beta: float,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor | None:
+    """Run the gfx950 precomputed-route SiTU MoE path.
+
+    Decode (up to 16 tokens) dynamically quantizes the BF16 input to FP8 and
+    uses route-direct FP8xMXFP4 MFMAs. Larger batches reuse the zero-copy
+    preshuffled aliases and the block-ragged MXFP4 prefill kernels. ``None`` is
+    returned when the input or weight layout is unsupported.
+    """
+    if (
+        hidden_states.ndim != 2
+        or hidden_states.dtype != torch.bfloat16
+        or out_dtype != torch.bfloat16
+        or topk_ids.ndim != 2
+        or topk_weights.shape != topk_ids.shape
+        or situ_beta <= 0.0
+        or situ_linear_beta <= 0.0
+    ):
+        return None
+
+    M, D = hidden_states.shape
+    TOPK = int(topk_ids.shape[1])
+    if M > 16:
+        return _maybe_gluon_package_mxfp4_prefill(
+            hidden_states,
+            hidden_states.new_empty((M, 0)),
+            w13_weight,
+            w2_weight,
+            w13_mx_scale=w13_mx_scale,
+            w2_mx_scale=w2_mx_scale,
+            top_k=TOPK,
+            correction_bias=None,
+            n_group=0,
+            topk_group=0,
+            routed_scaling_factor=1.0,
+            normalize_topk_weights=True,
+            routing_method_type=0,
+            precomputed_topk_weights=topk_weights,
+            precomputed_topk_ids=topk_ids,
+            out_dtype=out_dtype,
+            swiglu_alpha=float(situ_beta),
+            swiglu_limit=0.0,
+            swiglu_beta=0.0,
+            situ_linear_beta=float(situ_linear_beta),
+        )
+
+    w13_raw = _extract_gluon_raw_w(w13_weight)
+    w2_raw = _extract_gluon_raw_w(w2_weight)
+    w13_scale = _extract_gluon_raw_s(w13_mx_scale)
+    w2_scale = _extract_gluon_raw_s(w2_mx_scale)
+    if not all(
+        isinstance(t, torch.Tensor) for t in (w13_raw, w2_raw, w13_scale, w2_scale)
+    ):
+        return None
+    if not (
+        w13_raw.ndim == 3
+        and w2_raw.ndim == 3
+        and w13_raw.dtype == torch.uint8
+        and w2_raw.dtype == torch.uint8
+        and bool(getattr(w13_raw, "is_shuffled_for_gluon_dot", False))
+        and bool(getattr(w2_raw, "is_shuffled_for_gluon_dot", False))
+    ):
+        return None
+
+    two_i = int(w13_raw.shape[2])
+    if two_i % 2 or int(getattr(w13_raw, "original_k_pk", 0)) * 2 != D:
+        return None
+    i_dim = two_i // 2
+    N = int(getattr(w2_raw, "original_n", int(w2_raw.shape[2])))
+    if int(getattr(w2_raw, "original_k_pk", 0)) * 2 != i_dim or N != D:
+        return None
+
+    topk_ids = topk_ids.to(torch.int32)
+    topk_weights = topk_weights.to(torch.float32)
+    x_fp8, x_scale = _dynamic_fp8_quantize(hidden_states)
+    inter_scale = _situ_intermediate_scale(
+        hidden_states.device, float(situ_beta * situ_linear_beta)
+    )
+    inter = torch.empty(
+        (M * TOPK, i_dim), dtype=torch.float8_e4m3fn, device=hidden_states.device
+    )
+    partial = torch.empty((M * TOPK, N), dtype=out_dtype, device=hidden_states.device)
+    out = torch.empty((M, N), dtype=out_dtype, device=hidden_states.device)
+    dummy_bias = _make_dummy(hidden_states.device, torch.float32, 1)
+
+    BLOCK_N = 128
+    BLOCK_K = 256
+    NUM_WARPS = 4
+    k_iters = (D + BLOCK_K - 1) // BLOCK_K
+    even_k = D % BLOCK_K == 0
+    num_buffers = min(2, k_iters + (1 if even_k else 0))
+    grid = (M * triton.cdiv(two_i, BLOCK_N) * TOPK,)
+    _warp_decode_precomputed_situ_stage1_kernel[grid](
+        x_fp8.view(torch.uint8),
+        w13_raw,
+        w13_scale,
+        topk_ids,
+        inter,
+        M,
+        D,
+        i_dim,
+        x_fp8.stride(0),
+        x_fp8.stride(1),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        w13_raw.stride(0),
+        w13_raw.stride(-2),
+        w13_raw.stride(-1),
+        w13_scale.stride(0),
+        w13_scale.stride(-2),
+        w13_scale.stride(-1),
+        inter.stride(0),
+        inter.stride(1),
+        x_scale,
+        inter_scale,
+        dummy_bias,
+        TOPK=TOPK,
+        BLOCK_K=BLOCK_K,
+        BLOCK_N=BLOCK_N,
+        BLOCK_M=16,
+        NUM_BUFFERS=num_buffers,
+        NUM_WARPS=NUM_WARPS,
+        W_PRESHUFFLED=True,
+        EVEN_K=even_k,
+        HAS_BIAS=False,
+        SITU_BETA=float(situ_beta),
+        SITU_LINEAR_BETA=float(situ_linear_beta),
+        num_warps=NUM_WARPS,
+    )
+
+    s2_block_n = 16 if M > 1 else 8
+    s2_m_dup = 1
+    s2_grid = (M * TOPK * triton.cdiv(N, s2_block_n),)
+    _warp_decode_stage2_fp8_mxfp4_kernel[s2_grid](
+        inter,
+        w2_raw,
+        w2_scale,
+        topk_ids,
+        topk_weights,
+        partial,
+        M,
+        N,
+        int(w2_raw.shape[2]),
+        i_dim,
+        inter.stride(0),
+        inter.stride(1),
+        w2_raw.stride(0),
+        w2_raw.stride(-2),
+        w2_raw.stride(-1),
+        w2_scale.stride(0),
+        w2_scale.stride(-2),
+        w2_scale.stride(-1),
+        partial.stride(0),
+        partial.stride(1),
+        0,
+        inter_scale,
+        dummy_bias,
+        I_PACKED=i_dim // 2,
+        TOPK=TOPK,
+        BLOCK_K=128,
+        BLOCK_N=s2_block_n,
+        M_DUP=s2_m_dup,
+        W_PRESHUFFLED=True,
+        HAS_BIAS=False,
+        SPLIT_K=1,
+        SPLIT_TOPK=True,
+        num_warps=1,
+    )
+    reduce_block_n = 256
+    _moe_partial_reduce[(M * triton.cdiv(N, reduce_block_n),)](
+        partial,
+        out,
+        M,
+        N,
+        partial.stride(0),
+        TOPK * partial.stride(0),
+        partial.stride(1),
+        out.stride(0),
+        out.stride(1),
+        SPLIT_K=TOPK,
+        BLOCK_N=reduce_block_n,
+        num_warps=1,
+    )
+    return out
+
+
 def gluon_mxfp_fused_moe(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -8265,6 +8493,7 @@ def _maybe_gluon_package_mxfp4_prefill(
     swiglu_alpha: float,
     swiglu_limit: float,
     swiglu_beta: float,
+    situ_linear_beta: float | None = None,
 ) -> torch.Tensor | None:
     """Dispatch into the dedicated gfx950 A4W4 block-ragged prefill package.
 
@@ -8373,7 +8602,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         int(package_w13.shape[1]) != 2 * inter_dim
         or int(package_w13.shape[2]) * 2 != hidden_dim
         or int(package_w2.shape[1]) != hidden_dim
-        or int(package_w2.shape[2]) * 2 != inter_dim
+        or int(package_w2.shape[2]) * 2 < inter_dim
     ):
         return None
 
@@ -8440,8 +8669,12 @@ def _maybe_gluon_package_mxfp4_prefill(
         swiglu_alpha=float(swiglu_alpha),
         swiglu_limit=float(swiglu_limit),
         swiglu_beta=float(swiglu_beta),
+        situ_linear_beta=situ_linear_beta,
     )
     inter_flat = inter.view(n_tokens * top_k, inter_dim)
+    stage2_k = int(package_w2.shape[2]) * 2
+    if stage2_k != inter_dim:
+        inter_flat = torch.nn.functional.pad(inter_flat, (0, stage2_k - inter_dim))
 
     q_inter, q_inter_scale = _quantize_mxfp4_activation(inter_flat)
 
@@ -8465,7 +8698,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         q_inter_scale,
         s2_sorted_ids,
         source_rows=n_tokens * top_k,
-        cols=inter_dim,
+        cols=stage2_k,
         top_k=top_k,
         flatten_topk=True,
     )
@@ -9940,6 +10173,7 @@ def _warp_decode_stage1_coop_compute(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    DO_SITU: gl.constexpr = False,
 ):
     """Cooperative gate_up GEMM + bias + SwiGLU + fp8-quant + store for one
     (token, slot, expert).  N runs over the INTERLEAVED gate_up rows (2*I);
@@ -10114,14 +10348,17 @@ def _warp_decode_stage1_coop_compute(
         )
         acc = acc + bias[None, :].to(gl.float32)
 
-    out = _swiglu_reduce(
-        acc,
-        SWIGLU_ALPHA,
-        SWIGLU_LIMIT,
-        SWIGLU_BETA,
-        OUT_BLOCK_N,
-        cfg.acc_layout,
-    )
+    if DO_SITU:
+        out = _situ_reduce(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N)
+    else:
+        out = _swiglu_reduce(
+            acc,
+            SWIGLU_ALPHA,
+            SWIGLU_LIMIT,
+            SWIGLU_BETA,
+            OUT_BLOCK_N,
+            cfg.acc_layout,
+        )
     out_inv_scale = 1.0 / gl.load(out_quant_scale_ptr).to(gl.float32)
     out = (out * out_inv_scale).to(Y.dtype.element_ty)
     STORE_LAYOUT: gl.constexpr = out.type.layout
@@ -10267,6 +10504,96 @@ def _warp_decode_topk_stage1_coop_kernel(
         W_PRESHUFFLED, EVEN_K, HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA,
     )
     # fmt: on
+
+
+@gluon.jit
+def _warp_decode_precomputed_situ_stage1_kernel(
+    X,
+    W,
+    WScale,
+    TopkIds,
+    Y,
+    M,
+    D,
+    i_dim,
+    stride_xm,
+    stride_xk,
+    stride_tim,
+    stride_tik,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    w13_bias,
+    TOPK: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SITU_BETA: gl.constexpr,
+    SITU_LINEAR_BETA: gl.constexpr,
+):
+    """Route-direct FP8xMXFP4 W13 with a fused SiTU and FP8 store."""
+    pid = gl.program_id(axis=0)
+    num_pid_n = gl.cdiv(2 * i_dim, BLOCK_N)
+    slot = pid % TOPK
+    rest = pid // TOPK
+    pid_n = rest % num_pid_n
+    token = rest // num_pid_n
+    expert = gl.load(
+        TopkIds + token.to(gl.int64) * stride_tim + slot * stride_tik,
+        mask=token < M,
+        other=-1,
+    ).to(gl.int32)
+    _warp_decode_stage1_coop_compute(
+        token,
+        slot,
+        expert,
+        pid_n,
+        X,
+        W,
+        WScale,
+        Y,
+        M,
+        D,
+        i_dim,
+        stride_xm,
+        stride_xk,
+        stride_we,
+        stride_wk,
+        stride_wn,
+        stride_wse,
+        stride_wsk,
+        stride_wsn,
+        stride_ym,
+        stride_yn,
+        x_global_scale_ptr,
+        out_quant_scale_ptr,
+        w13_bias,
+        TOPK,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        NUM_BUFFERS,
+        NUM_WARPS,
+        W_PRESHUFFLED,
+        EVEN_K,
+        HAS_BIAS,
+        SITU_BETA,
+        SITU_LINEAR_BETA,
+        0.0,
+        DO_SITU=True,
+    )
 
 
 @gluon.jit
@@ -10456,6 +10783,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     W_PRESHUFFLED: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SPLIT_K: gl.constexpr,
+    SPLIT_TOPK: gl.constexpr = False,
 ):
     """Direct top-k stage2: FP8 intermediate x MXFP4 W2 -> BF16 output.
 
@@ -10473,13 +10801,25 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
             "128-wide shuffled tile and BLOCK_K_PACKED=64 so two stage2 "
             "iterations cover one 128-packed-byte K tile.",
         )
+    gl.static_assert(
+        not (SPLIT_K > 1 and SPLIT_TOPK),
+        "stage2 cannot split K and top-k simultaneously",
+    )
     pid = gl.program_id(axis=0)
     num_n = gl.cdiv(N, BLOCK_N)
-    if SPLIT_K == 1:
+    if SPLIT_TOPK:
         pid_k = 0
+        pid_token = pid // (TOPK * num_n)
+        rem = pid % (TOPK * num_n)
+        pid_slot = rem // num_n
+        pid_n = rem % num_n
+    elif SPLIT_K == 1:
+        pid_k = 0
+        pid_slot = 0
         pid_token = pid // num_n
         pid_n = pid % num_n
     else:
+        pid_slot = 0
         per_k = M * num_n
         pid_k = pid // per_k
         rem = pid % per_k
@@ -10511,7 +10851,9 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     a_scale = gl.full((M_DUP, BLOCK_K_SCALE), 127, gl.uint8, layout=a_scale_layout)
     acc_total = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
     if pid_token < M:
-        for slot in gl.static_range(0, TOPK):
+        NUM_SLOTS: gl.constexpr = 1 if SPLIT_TOPK else TOPK
+        for slot_iter in gl.static_range(0, NUM_SLOTS):
+            slot = pid_slot if SPLIT_TOPK else slot_iter
             expert = gl.load(
                 TopkIds + pid_token * TOPK + slot, mask=pid_token < M, other=-1
             )
@@ -10596,9 +10938,10 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     sm = gl.arange(0, M_DUP, layout=gl.SliceLayout(1, mfma_layout))[:, None]
     sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
     col = pid_n * BLOCK_N + sn
+    out_row = pid_token * TOPK + pid_slot if SPLIT_TOPK else pid_token
     out_base = (
         Out
-        + pid_token.to(gl.int64) * stride_om
+        + out_row.to(gl.int64) * stride_om
         + col.to(gl.int64) * stride_on
         + sm.to(gl.int64) * 0
     )
@@ -11447,6 +11790,33 @@ def _fp8_quantize_kernel(
     tl.store(out_ptr + out_off, x_fp8, mask=load_mask)
 
 
+@triton.jit
+def _dynamic_fp8_quantize_kernel(x_ptr, out_ptr, scale_ptr, N: tl.constexpr):
+    BLOCK: tl.constexpr = triton.next_power_of_2(N)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < N
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x)), 1.0e-12)
+    scale = amax / 448.0
+    tl.store(scale_ptr, scale)
+    tl.store(out_ptr + offsets, (x / scale).to(tl.float8e4nv), mask=mask)
+
+
+def _dynamic_fp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if not x.is_contiguous():
+        x = x.contiguous()
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(1, dtype=torch.float32, device=x.device)
+    _dynamic_fp8_quantize_kernel[(1,)](
+        x,
+        out,
+        scale,
+        N=x.numel(),
+        num_warps=8,
+    )
+    return out, scale
+
+
 def _flatten_to_2d(x: torch.Tensor):
     assert x.stride(-1) == 1, f"expected stride-1 inner dim, got stride={x.stride(-1)}"
     N = x.shape[-1]
@@ -11538,6 +11908,7 @@ def fp8_quantize(
 
 
 __all__ = [
+    "gluon_mxfp4_fp8_precomputed_situ",
     "gluon_mxfp_fused_moe",
     "gluon_mxfp_ragged_matmul",
     "gluon_mxfp_combine",

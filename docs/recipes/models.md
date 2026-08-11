@@ -236,8 +236,10 @@ Blackwell GPU (B200/B300); on other NVIDIA platforms use
 
 ### AMD
 
-The standard AMD path on 8x gfx950 uses the `mla` backend. For TP8/EP8,
-automatic MoE selection uses the specialized Gluon SiTU kernels:
+The standard AMD path on 8x gfx950 uses the `mla` backend. Plain TP8 shards
+each expert's intermediate dimension and automatically selects the FP8 x
+MXFP4 Gluon SiTU path; TP8/EP8 remains available for memory-constrained
+deployments:
 
 ```bash
 tokenspeed serve moonshotai/Kimi-K3 \
@@ -247,7 +249,6 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --kv-cache-dtype fp8 \
   --tensor-parallel-size 8 \
   --mm-encoder-tp-mode data \
-  --enable-expert-parallel \
   --attention-backend mla \
   --moe-backend auto \
   --gpu-memory-utilization 0.92 \
@@ -257,9 +258,12 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --port 8000
 ```
 
-On gfx950, the replicated 7168↔3584 latent projections automatically select
+Add `--enable-expert-parallel` to use TP8/EP8 instead. On gfx950, the
+replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
-to the current token count. At TP8/EP8, eligible one-token decode also combines
+to the current token count. Plain TP8 dynamically quantizes small decode
+batches to FP8, runs route-parallel MXFP4 SiTU experts, and uses the block-ragged
+MXFP4 package for prefill. At TP8/EP8, eligible one-token decode also combines
 the routed MXFP4 experts with the shared-expert down projection, then applies
 their joint reduction before the fused latent up-projection epilogue. Other
 shapes and unsupported layouts retain the ordinary composed path. The fused

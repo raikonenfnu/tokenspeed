@@ -34,6 +34,64 @@ if not is_cdna4():
     )
 
 import tokenspeed_kernel  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
+    gluon_mxfp4_fp8_precomputed_situ,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_grouped import (  # noqa: E402
+    gluon_a16w4_situ_grouped_ep_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
+    preprocess_gluon_mxfp4_gfx950_moe_weights,
+)
+
+
+@pytest.mark.parametrize("num_tokens", [8, 32])
+def test_situ_tp_matches_reference_gfx950(num_tokens: int) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260811)
+    num_experts, hidden_size, intermediate_size, top_k = 4, 256, 384, 4
+    module, raw = _make_mxfp4_module(
+        num_experts=num_experts,
+        latent_size=hidden_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        generator=generator,
+    )
+    module.w13_input_layout = "interleaved"
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module, preshuffle=True)
+    hidden_states = 0.1 * torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+
+    actual = gluon_mxfp4_fp8_precomputed_situ(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    expected = a16w4_mxfp4_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert actual is not None
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
 
 
 def _make_mxfp4_module(
@@ -235,25 +293,16 @@ def test_gluon_grouped_a16w4_situ_matches_kimi_k3_shape_gfx950() -> None:
         * 0.1
     )
     topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
-    router_logits = torch.zeros(
-        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
-    )
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="situ",
-        routing_mode="precomputed_topk",
-        internal_activation_dtype="input",
-        solution="gluon",
-    )
-    tokenspeed_kernel.moe_process_weights(plan, module)
-    actual = tokenspeed_kernel.moe_apply(
-        plan,
+    actual = gluon_a16w4_situ_grouped_ep_gfx950(
         hidden_states,
-        module,
-        router_logits,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_weights,
+        topk_ids,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
     )
     expected = a16w4_mxfp4_moe_reference(
         hidden_states,
