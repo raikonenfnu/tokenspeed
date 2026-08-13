@@ -162,6 +162,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _stage_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
+    """Stage CPU checkpoint views in pageable memory before accelerator copies.
+
+    Safetensors exposes file-backed mmap views. On ROCm, copying thousands of
+    distinct views directly to a GPU repeatedly pays HMM/SVM range-registration
+    overhead. A transient clone uses reusable anonymous CPU storage instead.
+    Keep it pageable: pinned staging can interfere with later GPU collectives.
+    """
+    if loaded_weight.device.type == "cpu" and torch.cuda.is_available():
+        return loaded_weight.clone()
+    return loaded_weight
+
+
 # ===----------------------------------------------------------------------=== #
 # Multimodal vision path
 # ===----------------------------------------------------------------------=== #
@@ -1202,7 +1215,13 @@ class KimiLinearMoE(nn.Module):
                 shared_reduce=(
                     None
                     if self.execution_plan.joint_moe_reduce
-                    else self._reduce_shared
+                    else self._reduce_moe_partial
+                ),
+                # W13/W2 are intermediate-dimension sharded under MoE TP, so
+                # W2 produces a partial latent that must be summed before its
+                # replicated norm and up-projection.
+                latent_reduce=(
+                    self._reduce_moe_partial if mapping.moe.tp_size > 1 else None
                 ),
                 joint_reduce=self.execution_plan.joint_moe_reduce,
                 shared_expert_stream=(
@@ -1447,7 +1466,7 @@ class KimiLinearMoE(nn.Module):
                 shared_out,
             ).view(num_tokens, hidden_size)
         else:
-            shared_out = self._reduce_shared(shared_partial)
+            shared_out = self._reduce_moe_partial(shared_partial)
         # routed_scaling_factor already applied in TopK; not re-applied here
         # (matches the reference).
         return add3(
@@ -1456,11 +1475,11 @@ class KimiLinearMoE(nn.Module):
             shared_out.view(num_tokens, hidden_size),
         )
 
-    def _reduce_shared(self, shared_partial: torch.Tensor) -> torch.Tensor:
-        """Reduce the shared experts' TP partial on the current (default) stream."""
+    def _reduce_moe_partial(self, partial: torch.Tensor) -> torch.Tensor:
+        """Reduce a tensor-sharded MoE partial on the current stream."""
         if self.mapping.moe.tp_ep_size > 1:
-            return all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
-        return shared_partial
+            return all_reduce(partial, self.mapping.moe.tp_ep_group)
+        return partial
 
 
 class KimiLinearDecoderLayer(nn.Module):
@@ -2218,11 +2237,13 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 if mapped not in params_dict:
                     continue
                 param = params_dict[mapped]
-                param.weight_loader(param, loaded_weight, shard_id)
+                param.weight_loader(
+                    param, _stage_checkpoint_weight(loaded_weight), shard_id
+                )
                 break
             else:
                 if moe_loader.matches(name):
-                    moe_loader.load(name, loaded_weight)
+                    moe_loader.load(name, _stage_checkpoint_weight(loaded_weight))
                     continue
 
                 if fuse_qkv_a_proj and ".g_proj" in name:
@@ -2242,7 +2263,11 @@ class KimiLinearForCausalLM(BaseCausalLM):
                         gate_rows = loaded_weight.shape[0] // self.mapping.attn.tp_size
                         gate_start = self.mapping.attn.tp_rank * gate_rows
                         gate_shard = loaded_weight[gate_start : gate_start + gate_rows]
-                        param.weight_loader(param, gate_shard, begin_size=gate_offset)
+                        param.weight_loader(
+                            param,
+                            _stage_checkpoint_weight(gate_shard),
+                            begin_size=gate_offset,
+                        )
                         continue
 
                 if fuse_qkv_a_proj and (
@@ -2263,14 +2288,18 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     param = params_dict.get(mapped)
                     if param is None:
                         continue
-                    param.weight_loader(param, loaded_weight, begin_size=begin_size)
+                    param.weight_loader(
+                        param,
+                        _stage_checkpoint_weight(loaded_weight),
+                        begin_size=begin_size,
+                    )
                     continue
 
                 param = params_dict.get(name)
                 if param is None:
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                weight_loader(param, _stage_checkpoint_weight(loaded_weight))
 
         self.post_load_weights()
 
@@ -2527,7 +2556,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
                         dropped_vision_weights += 1
                     else:
                         assert vision_params is not None
-                        self.vision.load_weight(name, weight, vision_params)
+                        self.vision.load_weight(
+                            name, _stage_checkpoint_weight(weight), vision_params
+                        )
                         loaded_vision_weights += 1
                     continue
                 if name.startswith("language_model."):

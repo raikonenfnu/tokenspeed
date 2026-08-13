@@ -263,11 +263,18 @@ replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
 to the current token count. Plain TP8 dynamically quantizes small decode
 batches to FP8, runs route-parallel MXFP4 SiTU experts, and uses the block-ragged
-MXFP4 package for prefill. At TP8/EP8, eligible one-token decode also combines
-the routed MXFP4 experts with the shared-expert down projection, then applies
-their joint reduction before the fused latent up-projection epilogue. Other
-shapes and unsupported layouts retain the ordinary composed path. The fused
-sigmoid-bias top-k route supports the full scheduled token count.
+MXFP4 package for prefill; each rank's W2 partial is reduced across TP before
+the replicated latent up-projection. At TP8/EP8, eligible one-token decode also
+combines the routed MXFP4 experts with the shared-expert down projection, then
+applies their joint reduction before the fused latent up-projection epilogue.
+Other shapes and unsupported layouts retain the ordinary composed path. The
+fused sigmoid-bias top-k route supports the full scheduled token count.
+
+On ROCm, K3 stages CPU checkpoint views through transient pageable allocations
+before device copies to avoid repeatedly registering thousands of safetensors
+mmap ranges. Keep this memory pageable; pinned staging can interfere with the
+first RCCL collective. For cold multi-rank loads, disabling checkpoint read-ahead
+with `--disable-weight-loader-prefetch-checkpoints` can also avoid I/O contention.
 
 ## GLM5 / GLM5.2
 

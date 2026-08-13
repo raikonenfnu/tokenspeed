@@ -319,7 +319,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
         self.assertTrue(mixed_qkv.is_contiguous())
 
-    def test_ep_kimi_moe_combines_shared_and_routed_reductions(self):
+    def test_kimi_moe_reduces_sharded_shared_and_routed_outputs(self):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3
 
         shared_calls = []
@@ -354,7 +354,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.components = kwargs
 
         ep_group = tuple(range(8))
-        mapping = SimpleNamespace(
+        ep_mapping = SimpleNamespace(
             moe=SimpleNamespace(
                 tp_rank=0,
                 tp_size=1,
@@ -365,6 +365,20 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 tp_ep_size=8,
                 tp_ep_rank=0,
                 tp_ep_group=ep_group,
+            )
+        )
+        tp_group = tuple(range(8))
+        tp_mapping = SimpleNamespace(
+            moe=SimpleNamespace(
+                tp_rank=0,
+                tp_size=8,
+                tp_group=tp_group,
+                ep_rank=0,
+                ep_size=1,
+                ep_group=(0,),
+                tp_ep_size=8,
+                tp_ep_rank=0,
+                tp_ep_group=tp_group,
             )
         )
         config = KimiLinearConfig(
@@ -389,11 +403,19 @@ class KimiK3RegistrationTests(unittest.TestCase):
             mock.patch.object(
                 kimi_k3.Kimi3MoEExecutionPlan,
                 "build",
-                return_value=kimi_k3.Kimi3MoEExecutionPlan(
-                    use_native=True,
-                    use_trtllm=False,
-                    overlap_shared_experts=False,
-                    joint_moe_reduce=True,
+                side_effect=(
+                    kimi_k3.Kimi3MoEExecutionPlan(
+                        use_native=True,
+                        use_trtllm=False,
+                        overlap_shared_experts=False,
+                        joint_moe_reduce=True,
+                    ),
+                    kimi_k3.Kimi3MoEExecutionPlan(
+                        use_native=True,
+                        use_trtllm=False,
+                        overlap_shared_experts=False,
+                        joint_moe_reduce=False,
+                    ),
                 ),
             ),
             mock.patch.dict(
@@ -401,9 +423,16 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 {"enforce_eager": False},
             ),
         ):
-            layer = kimi_k3.KimiLinearMoE(
+            ep_layer = kimi_k3.KimiLinearMoE(
                 config,
-                mapping,
+                ep_mapping,
+                quant_config=None,
+                layer_index=1,
+                prefix="model.layers.1.block_sparse_moe",
+            )
+            tp_layer = kimi_k3.KimiLinearMoE(
+                config,
+                tp_mapping,
                 quant_config=None,
                 layer_index=1,
                 prefix="model.layers.1.block_sparse_moe",
@@ -411,10 +440,21 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         self.assertFalse(shared_calls[0]["reduce_results"])
         self.assertEqual(expert_calls[0]["internal_activation_dtype_override"], "input")
-        self.assertTrue(layer.native_latent_moe.components["joint_reduce"])
+        self.assertTrue(ep_layer.native_latent_moe.components["joint_reduce"])
         self.assertEqual(
-            layer.native_latent_moe.components["expert_parallel_group"], ep_group
+            ep_layer.native_latent_moe.components["expert_parallel_group"], ep_group
         )
+        self.assertIsNone(ep_layer.native_latent_moe.components["latent_reduce"])
+        self.assertFalse(tp_layer.native_latent_moe.components["joint_reduce"])
+        routed_partial = torch.ones(1, 2)
+        with mock.patch.object(
+            kimi_k3, "all_reduce", return_value=routed_partial * 8
+        ) as reduce_mock:
+            routed = tp_layer.native_latent_moe.components["latent_reduce"](
+                routed_partial
+            )
+        torch.testing.assert_close(routed, routed_partial * 8)
+        reduce_mock.assert_called_once_with(routed_partial, tp_group)
 
     def test_mla_gate_projection_uses_api_selected_layout(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention

@@ -56,11 +56,58 @@ def test_situ_tp_matches_reference_gfx950(num_tokens: int) -> None:
         top_k=top_k,
         generator=generator,
     )
-    module.w13_input_layout = "interleaved"
     preprocess_gluon_mxfp4_gfx950_moe_weights({}, module, preshuffle=True)
     hidden_states = 0.1 * torch.randn(
         num_tokens,
         hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+
+    actual = gluon_mxfp4_fp8_precomputed_situ(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    expected = a16w4_mxfp4_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert actual is not None
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 16, 32])
+def test_situ_tp_matches_kimi_k3_shape_gfx950(num_tokens: int) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260813)
+    num_experts, latent_size, intermediate_size, top_k = 16, 3584, 384, 16
+    module, raw = _make_mxfp4_module(
+        num_experts=num_experts,
+        latent_size=latent_size,
+        intermediate_size=intermediate_size,
+        top_k=top_k,
+        generator=generator,
+    )
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module, preshuffle=True)
+    hidden_states = 0.1 * torch.randn(
+        num_tokens,
+        latent_size,
         dtype=torch.bfloat16,
         device="cuda",
         generator=generator,
