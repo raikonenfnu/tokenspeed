@@ -39,6 +39,12 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 
+_GFX950_CU_COUNT = 256
+_LONG_PREFILL_MIN_KV_TOKENS = 8192
+_LONG_PREFILL_BLOCK_N = 32
+_LONG_PREFILL_TARGET_WAVES = 4
+_LONG_PREFILL_MAX_SPLITS = 4
+
 
 # ===-----------------------------------------------------------------------===#
 # Kernel Config
@@ -421,6 +427,42 @@ class AttentionProgram:
             )
             cdna4.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
 
+    @gluon.jit
+    def store_partial(
+        self,
+        acc,
+        l_i,
+        m_i,
+        split_id,
+        mid_o_ptr,
+        mid_lse_ptr,
+        NUM_KV_SPLITS: gl.constexpr,
+    ):
+        """Store one locally normalized split and its base-2 log-sum-exp."""
+        cfg = self.cfg
+        offs_m = self.q_start + gl.arange(
+            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
+        )
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
+        row = self.seq_base_q + offs_m
+        valid = offs_m < self.q_len
+
+        acc = gl.convert_layout(acc, cfg.store_layout)
+        l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.store_layout))
+        m_i = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.store_layout))
+        has_kv = l_i > 0.0
+        denom = gl.where(has_kv, l_i, 1.0)
+        part_o = acc * (1.0 / denom)[:, None]
+        part_lse = gl.where(
+            has_kv,
+            m_i + gl.log2(denom),
+            -float("inf"),
+        )
+        base = (row * cfg.N_HEADS + self.q_head) * NUM_KV_SPLITS + split_id
+        o_offsets = base[:, None] * cfg.HEAD_DIM + offs_d[None, :]
+        cdna4.buffer_store(part_o, mid_o_ptr, o_offsets, mask=valid[:, None])
+        cdna4.buffer_store(part_lse, mid_lse_ptr, base, mask=valid)
+
 
 # ===-----------------------------------------------------------------------===#
 # Tile processing
@@ -603,6 +645,119 @@ def process_query_block(
     output = acc * (1.0 / denom)[:, None]
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
+
+
+@gluon.jit
+def process_query_block_split(
+    program: AttentionProgram,
+    k_smem: gl.shared_memory_descriptor,
+    k_pe_smem: gl.shared_memory_descriptor,
+    v_smem: gl.shared_memory_descriptor,
+    split_id,
+    mid_o_ptr,
+    mid_lse_ptr,
+    NUM_KV_SPLITS: gl.constexpr,
+):
+    """Process one page-aligned KV partition for a query block."""
+    cfg = program.cfg
+    q = program.load_q_nope()
+    q_pe = program.load_q_pe()
+    m_i, l_i, acc = program.init_state()
+    causal_row = (program.q_causal_start + program.q_start) + gl.arange(
+        0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
+    )
+
+    if cfg.IS_CAUSAL:
+        main_end = (program.q_causal_start + program.q_start) // cfg.BLOCK_N
+        main_end = gl.minimum(main_end, program.kv_len // cfg.BLOCK_N)
+        visible = program.q_causal_start + program.q_start + cfg.BLOCK_M
+        visible = gl.minimum(visible, program.kv_len)
+        total_tiles = (visible + cfg.BLOCK_N - 1) // cfg.BLOCK_N
+    else:
+        main_end = program.kv_len // cfg.BLOCK_N
+        total_tiles = (program.kv_len + cfg.BLOCK_N - 1) // cfg.BLOCK_N
+
+    tiles_per_split = (total_tiles + NUM_KV_SPLITS - 1) // NUM_KV_SPLITS
+    split_begin = split_id * tiles_per_split
+    split_end = gl.minimum(split_begin + tiles_per_split, total_tiles)
+    full_end = gl.minimum(split_end, main_end)
+
+    # Pipeline the wholly visible part of this split.
+    if split_begin < full_end:
+        issue_tile_loads(
+            program,
+            k_smem.index(0),
+            k_pe_smem.index(0),
+            v_smem.index(0),
+            split_begin * cfg.BLOCK_N,
+            False,
+        )
+    for tile in range(split_begin, full_end):
+        local_tile = tile - split_begin
+        buf = local_tile % 2
+        async_copy.wait_group(0)
+        if tile + 1 < full_end:
+            nxt = (local_tile + 1) % 2
+            issue_tile_loads(
+                program,
+                k_smem.index(nxt),
+                k_pe_smem.index(nxt),
+                v_smem.index(nxt),
+                (tile + 1) * cfg.BLOCK_N,
+                False,
+            )
+        m_i, l_i, acc = compute_tile(
+            program,
+            k_smem.index(buf),
+            k_pe_smem.index(buf),
+            v_smem.index(buf),
+            q,
+            q_pe,
+            tile * cfg.BLOCK_N,
+            causal_row,
+            m_i,
+            l_i,
+            acc,
+            False,
+        )
+
+    # Only the causal diagonal and final KV tail require masks.
+    masked_begin = gl.maximum(split_begin, full_end)
+    for tile in range(masked_begin, split_end):
+        kv_start = tile * cfg.BLOCK_N
+        issue_tile_loads(
+            program,
+            k_smem.index(0),
+            k_pe_smem.index(0),
+            v_smem.index(0),
+            kv_start,
+            True,
+        )
+        async_copy.wait_group(0)
+        m_i, l_i, acc = compute_tile(
+            program,
+            k_smem.index(0),
+            k_pe_smem.index(0),
+            v_smem.index(0),
+            q,
+            q_pe,
+            kv_start,
+            causal_row,
+            m_i,
+            l_i,
+            acc,
+            True,
+        )
+
+    program.store_partial(
+        acc,
+        l_i,
+        m_i,
+        split_id,
+        mid_o_ptr,
+        mid_lse_ptr,
+        NUM_KV_SPLITS,
+    )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -890,6 +1045,153 @@ def _mla_prefill_kernel(
         scheduler = scheduler.advance()
 
 
+@gluon.jit
+def _mla_prefill_split_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    mid_o_ptr,
+    mid_lse_ptr,
+    cu_seqlens_q_ptr,
+    cu_seqlens_kv_ptr,
+    Q_STRIDE_T: gl.constexpr,
+    Q_STRIDE_H: gl.constexpr,
+    K_STRIDE_T: gl.constexpr,
+    K_STRIDE_H: gl.constexpr,
+    V_STRIDE_T: gl.constexpr,
+    V_STRIDE_H: gl.constexpr,
+    N_HEADS: gl.constexpr,
+    N_KV_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    ROPE_DIM: gl.constexpr,
+    SM_SCALE: gl.constexpr,
+    IS_CAUSAL: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    BATCH_SIZE: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
+    IS_FP8: gl.constexpr,
+):
+    cfg = AttentionConfig(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        ROPE_DIM,
+        SM_SCALE,
+        IS_CAUSAL,
+        False,
+        BLOCK_M,
+        BLOCK_N,
+        NUM_WARPS,
+        BATCH_SIZE,
+        IS_FP8,
+        k_ptr.dtype.element_ty,
+        InputStrides(Q_STRIDE_T, Q_STRIDE_H, 1),
+        InputStrides(K_STRIDE_T, K_STRIDE_H, 1),
+        InputStrides(V_STRIDE_T, V_STRIDE_H, 1),
+        InputStrides(0, 0, 1),
+        InputStrides(0, 0, 1),
+    )
+    folded = gl.program_id(0)
+    split_id = folded % NUM_KV_SPLITS
+    query_block = folded // NUM_KV_SPLITS
+    batch = gl.program_id(1)
+    q_head = gl.program_id(2)
+
+    seq_base_q = gl.load(cu_seqlens_q_ptr + batch)
+    q_len = gl.load(cu_seqlens_q_ptr + batch + 1) - seq_base_q
+    seq_base_kv = gl.load(cu_seqlens_kv_ptr + batch)
+    kv_len = gl.load(cu_seqlens_kv_ptr + batch + 1) - seq_base_kv
+    q_start = query_block * cfg.BLOCK_M
+    q_causal_start = gl.maximum(kv_len - q_len, 0)
+    kv_head = q_head // (cfg.N_HEADS // cfg.N_KV_HEADS)
+    program = AttentionProgram(
+        cfg,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        mid_o_ptr,
+        mid_lse_ptr,
+        seq_base_q,
+        q_len,
+        seq_base_kv,
+        kv_len,
+        q_causal_start,
+        q_start,
+        q_head,
+        kv_head,
+    )
+    if q_start >= q_len:
+        return
+
+    k_smem = gl.allocate_shared_memory(
+        k_ptr.dtype.element_ty, [2, cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
+    )
+    k_pe_smem = gl.allocate_shared_memory(
+        k_ptr.dtype.element_ty, [2, cfg.BLOCK_N, cfg.ROPE_DIM], cfg.k_pe_smem_layout
+    )
+    v_smem = gl.allocate_shared_memory(
+        v_ptr.dtype.element_ty, [2, cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
+    )
+    process_query_block_split(
+        program,
+        k_smem,
+        k_pe_smem,
+        v_smem,
+        split_id,
+        mid_o_ptr,
+        mid_lse_ptr,
+        NUM_KV_SPLITS,
+    )
+
+
+@gluon.jit
+def _mla_prefill_split_reduce_kernel(
+    mid_o_ptr,
+    mid_lse_ptr,
+    out_ptr,
+    lse_out_ptr,
+    O_STRIDE_T: gl.constexpr,
+    O_STRIDE_H: gl.constexpr,
+    LSE_STRIDE_T: gl.constexpr,
+    LSE_STRIDE_H: gl.constexpr,
+    NUM_KV_SPLITS: gl.constexpr,
+    N_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    HAS_LSE: gl.constexpr,
+):
+    """Merge locally normalized MLA split outputs with global softmax weights."""
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, HEAD_DIM // 64], [1, 64], [1, 1], [1, 0]
+    )
+    row = gl.program_id(0)
+    q_head = gl.program_id(1)
+    SPLIT_TILE: gl.constexpr = 1 << (NUM_KV_SPLITS - 1).bit_length()
+    offs_s = gl.arange(0, SPLIT_TILE, layout=gl.SliceLayout(1, layout))
+    offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, layout))
+    valid = offs_s < NUM_KV_SPLITS
+    base = (row * N_HEADS + q_head) * NUM_KV_SPLITS + offs_s
+    part_lse = cdna4.buffer_load(mid_lse_ptr, base, mask=valid, other=-float("inf"))
+    part_o = cdna4.buffer_load(
+        mid_o_ptr,
+        base[:, None] * HEAD_DIM + offs_d[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    )
+    m_i = max(part_lse, axis=0)
+    beta = gl.exp2(part_lse - m_i)
+    denom = gl.sum(beta, axis=0)
+    acc = gl.sum(part_o * beta[:, None], axis=0)
+    output = (acc * (1.0 / denom)).to(out_ptr.dtype.element_ty)
+    out_offsets = row * O_STRIDE_T + q_head * O_STRIDE_H + offs_d
+    cdna4.buffer_store(output, out_ptr, out_offsets)
+    if HAS_LSE:
+        lse = (m_i + gl.log2(denom)) * _LN2
+        lse_offset = row * LSE_STRIDE_T + q_head * LSE_STRIDE_H
+        gl.store(lse_out_ptr + lse_offset, lse)
+
+
 # ===-----------------------------------------------------------------------===#
 # Host wrapper
 # ===-----------------------------------------------------------------------===#
@@ -925,6 +1227,23 @@ def get_config(*, q: torch.Tensor, k: torch.Tensor) -> LaunchConfig:
         num_warps=num_warps,
         grid=grid,
     )
+
+
+def _select_long_prefill_splits(*, base_ctas: int, num_kv_tiles: int) -> int:
+    """Choose the static long-context partition count for gfx950.
+
+    A 32-token KV tile uses little enough LDS for several resident CTAs per CU,
+    so filling four machine waves is profitable.  Keep at least two partitions:
+    even when the query grid is already large, the static partitioned scheduler
+    avoids the long serial walk and persistent-scheduler overhead of the short
+    path.  Powers of two keep partitions balanced without overpaying the merge.
+    """
+    target_ctas = _GFX950_CU_COUNT * _LONG_PREFILL_TARGET_WAVES
+    required = (target_ctas + base_ctas - 1) // base_ctas
+    if required < 2:
+        required = 2
+    splits = 1 << (required - 1).bit_length()
+    return min(splits, _LONG_PREFILL_MAX_SPLITS, num_kv_tiles)
 
 
 def gluon_mla_prefill_gfx950(
@@ -1001,6 +1320,88 @@ def gluon_mla_prefill_gfx950(
 
     config = get_config(q=q, k=k)
     batch_size = cu_seqlens_q.numel() - 1
+
+    # Long-prefix chunked prefill has only O(total_q / BLOCK_M * heads) query
+    # CTAs, each with a long serial KV walk. Partition that walk just enough to
+    # fill four waves of the machine, then merge the partial softmax states. Keep
+    # short prefill on the allocation-free persistent path.
+    use_split_kv = max_seqlen_kv >= _LONG_PREFILL_MIN_KV_TOKENS
+    if use_split_kv:
+        config = config._replace(block_n=_LONG_PREFILL_BLOCK_N)
+
+    blocks_per_request = (max_seqlen_q + config.block_m - 1) // config.block_m
+    base_ctas = blocks_per_request * batch_size * config.n_heads
+    num_kv_tiles = (max_seqlen_kv + config.block_n - 1) // config.block_n
+    num_kv_splits = 1
+    if use_split_kv:
+        num_kv_splits = _select_long_prefill_splits(
+            base_ctas=base_ctas,
+            num_kv_tiles=num_kv_tiles,
+        )
+
+    if num_kv_splits > 1:
+        mid_o = torch.empty(
+            (total_tokens, n_heads, num_kv_splits, v_head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        mid_lse = torch.empty(
+            (total_tokens, n_heads, num_kv_splits),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        split_grid = (
+            blocks_per_request * num_kv_splits,
+            batch_size,
+            config.n_heads,
+        )
+        _mla_prefill_split_kernel[split_grid](
+            q,
+            k,
+            v,
+            mid_o,
+            mid_lse,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            q.stride(0),
+            q.stride(1),
+            k.stride(0),
+            k.stride(1),
+            v.stride(0),
+            v.stride(1),
+            N_HEADS=config.n_heads,
+            N_KV_HEADS=config.n_kv_heads,
+            HEAD_DIM=config.head_dim,
+            ROPE_DIM=config.rope_dim,
+            SM_SCALE=softmax_scale,
+            IS_CAUSAL=is_causal,
+            BLOCK_M=config.block_m,
+            BLOCK_N=config.block_n,
+            NUM_WARPS=config.num_warps,
+            BATCH_SIZE=batch_size,
+            NUM_KV_SPLITS=num_kv_splits,
+            IS_FP8=is_fp8,
+            num_warps=config.num_warps,
+            num_stages=1,
+        )
+        _mla_prefill_split_reduce_kernel[(total_tokens, n_heads)](
+            mid_o,
+            mid_lse,
+            out,
+            lse_arg,
+            out.stride(0),
+            out.stride(1),
+            lse_arg.stride(0),
+            lse_arg.stride(1),
+            NUM_KV_SPLITS=num_kv_splits,
+            N_HEADS=n_heads,
+            HEAD_DIM=v_head_dim,
+            HAS_LSE=return_lse,
+            num_warps=1,
+        )
+        if return_lse:
+            return out, lse
+        return out
 
     _mla_prefill_kernel[config.grid](
         q,

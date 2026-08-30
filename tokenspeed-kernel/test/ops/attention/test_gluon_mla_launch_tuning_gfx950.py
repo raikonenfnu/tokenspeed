@@ -28,6 +28,34 @@ mla_decode = pytest.importorskip(
     "tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode",
     reason="tokenspeed-kernel-amd is required for MLA launch tuning tests",
 )
+mla_prefill = pytest.importorskip(
+    "tokenspeed_kernel_amd.ops.gfx950.attention.mla.prefill",
+    reason="tokenspeed-kernel-amd is required for MLA launch tuning tests",
+)
+
+
+@pytest.mark.parametrize(
+    "base_ctas,num_kv_tiles,expected_splits",
+    [
+        pytest.param(48, 256, 4, id="short-query-grid"),
+        pytest.param(384, 1563, 4, id="one-4k-chunk"),
+        pytest.param(768, 1563, 2, id="two-4k-chunks"),
+        pytest.param(3072, 1563, 2, id="eight-4k-chunks"),
+        pytest.param(384, 1, 1, id="cap-at-kv-tiles"),
+    ],
+)
+def test_long_prefill_split_selection(
+    base_ctas: int,
+    num_kv_tiles: int,
+    expected_splits: int,
+) -> None:
+    assert (
+        mla_prefill._select_long_prefill_splits(
+            base_ctas=base_ctas,
+            num_kv_tiles=num_kv_tiles,
+        )
+        == expected_splits
+    )
 
 
 def test_small_batch_target_workgroup_defaults_match_measured_winners() -> None:
