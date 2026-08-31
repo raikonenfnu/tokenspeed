@@ -87,3 +87,137 @@ def test_long_causal_split_prefill_matches_fp32_reference(
     assert out.data_ptr() == out_arg.data_ptr()
     if lse is not None:
         torch.testing.assert_close(lse, ref_lse, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.bfloat16, id="bf16"),
+        pytest.param(torch.float8_e4m3fn, id="fp8-e4m3"),
+    ],
+)
+def test_long_causal_split_prefill_matches_fp32_reference_for_ragged_batch(
+    dtype: torch.dtype,
+) -> None:
+    q_lens = (128, 64)
+    kv_lens = (8192, 8256)
+    torch.manual_seed(23)
+    q = (
+        torch.randn(sum(q_lens), _HEADS, _QK_DIM, device="cuda", dtype=torch.bfloat16)
+        .mul_(0.25)
+        .to(dtype)
+    )
+    k = (
+        torch.randn(sum(kv_lens), _HEADS, _QK_DIM, device="cuda", dtype=torch.bfloat16)
+        .mul_(0.25)
+        .to(dtype)
+    )
+    v = (
+        torch.randn(sum(kv_lens), _HEADS, _V_DIM, device="cuda", dtype=torch.bfloat16)
+        .mul_(0.25)
+        .to(dtype)
+    )
+    cu_q = torch.tensor([0, q_lens[0], sum(q_lens)], device="cuda", dtype=torch.int32)
+    cu_kv = torch.tensor(
+        [0, kv_lens[0], sum(kv_lens)], device="cuda", dtype=torch.int32
+    )
+
+    out, lse = gluon_mla_prefill_gfx950(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_kv,
+        max(q_lens),
+        max(kv_lens),
+        _SOFTMAX_SCALE,
+        is_causal=True,
+        return_lse=True,
+    )
+
+    q_base = 0
+    kv_base = 0
+    for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
+        q_seq = q[q_base : q_base + q_len]
+        k_seq = k[kv_base : kv_base + kv_len]
+        v_seq = v[kv_base : kv_base + kv_len]
+        scores = (
+            torch.einsum("qhd,khd->hqk", q_seq.float(), k_seq.float()) * _SOFTMAX_SCALE
+        )
+        prefix = kv_len - q_len
+        causal = torch.arange(kv_len, device="cuda")[None, :] <= (
+            prefix + torch.arange(q_len, device="cuda")[:, None]
+        )
+        scores.masked_fill_(~causal[None, :, :], float("-inf"))
+        ref_lse = torch.logsumexp(scores, dim=-1).transpose(0, 1)
+        ref_out = torch.einsum(
+            "hqk,khd->qhd", torch.softmax(scores, dim=-1), v_seq.float()
+        )
+
+        torch.testing.assert_close(
+            out[q_base : q_base + q_len].float(), ref_out, rtol=0.02, atol=0.02
+        )
+        torch.testing.assert_close(
+            lse[q_base : q_base + q_len], ref_lse, rtol=2e-4, atol=2e-4
+        )
+        q_base += q_len
+        kv_base += kv_len
+
+
+def test_long_causal_split_prefill_handles_empty_kv_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q_lens = (128, 64)
+    kv_lens = (0, 8192)
+    torch.manual_seed(29)
+    q = (
+        torch.randn(sum(q_lens), _HEADS, _QK_DIM, device="cuda", dtype=torch.bfloat16)
+        .mul_(0.25)
+        .to(torch.float8_e4m3fn)
+    )
+    k = (
+        torch.randn(sum(kv_lens), _HEADS, _QK_DIM, device="cuda", dtype=torch.bfloat16)
+        .mul_(0.25)
+        .to(torch.float8_e4m3fn)
+    )
+    v = (
+        torch.randn(sum(kv_lens), _HEADS, _V_DIM, device="cuda", dtype=torch.bfloat16)
+        .mul_(0.25)
+        .to(torch.float8_e4m3fn)
+    )
+    cu_q = torch.tensor([0, q_lens[0], sum(q_lens)], device="cuda", dtype=torch.int32)
+    cu_kv = torch.tensor(
+        [0, kv_lens[0], sum(kv_lens)], device="cuda", dtype=torch.int32
+    )
+
+    outputs = {}
+    lses = {}
+    for variant in ("persistent32", "split2"):
+        monkeypatch.setenv("TOKENSPEED_GFX950_MLA_PREFILL_VARIANT", variant)
+        outputs[variant], lses[variant] = gluon_mla_prefill_gfx950(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_kv,
+            max(q_lens),
+            max(kv_lens),
+            _SOFTMAX_SCALE,
+            is_causal=True,
+            return_lse=True,
+        )
+
+    assert torch.count_nonzero(outputs["split2"][: q_lens[0]]) == 0
+    assert torch.isneginf(lses["split2"][: q_lens[0]]).all()
+    torch.testing.assert_close(
+        outputs["split2"][q_lens[0] :],
+        outputs["persistent32"][q_lens[0] :],
+        rtol=0.02,
+        atol=0.02,
+    )
+    torch.testing.assert_close(
+        lses["split2"][q_lens[0] :],
+        lses["persistent32"][q_lens[0] :],
+        rtol=2e-4,
+        atol=2e-4,
+    )

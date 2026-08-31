@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import NamedTuple
 
 import torch
@@ -44,6 +45,11 @@ _LONG_PREFILL_MIN_KV_TOKENS = 8192
 _LONG_PREFILL_BLOCK_N = 32
 _LONG_PREFILL_TARGET_WAVES = 4
 _LONG_PREFILL_MAX_SPLITS = 4
+_LONG_PREFILL_VARIANT_ENV = "TOKENSPEED_GFX950_MLA_PREFILL_VARIANT"
+_SPLIT_NAN_DEBUG_ENV = "TOKENSPEED_GFX950_MLA_PREFILL_DEBUG_NAN"
+_LONG_PREFILL_VARIANTS = frozenset(
+    ("auto", "persistent32", "persistent64", "split2", "split4")
+)
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1180,14 +1186,25 @@ def _mla_prefill_split_reduce_kernel(
         other=0.0,
     )
     m_i = max(part_lse, axis=0)
-    beta = gl.exp2(part_lse - m_i)
+    # Ragged scheduler batches can contain a sequence with no local KV tokens.
+    # All of its partial LSE values are -inf, so subtracting the global maximum
+    # naively evaluates -inf - -inf and poisons the reduction with NaNs. Match
+    # the persistent path: empty attention produces a zero output and -inf LSE.
+    has_kv = m_i != -float("inf")
+    safe_m_i = gl.where(has_kv, m_i, 0.0)
+    beta = gl.exp2(part_lse - safe_m_i)
     denom = gl.sum(beta, axis=0)
     acc = gl.sum(part_o * beta[:, None], axis=0)
-    output = (acc * (1.0 / denom)).to(out_ptr.dtype.element_ty)
+    safe_denom = gl.where(denom > 0.0, denom, 1.0)
+    output = (acc * (1.0 / safe_denom)).to(out_ptr.dtype.element_ty)
     out_offsets = row * O_STRIDE_T + q_head * O_STRIDE_H + offs_d
     cdna4.buffer_store(output, out_ptr, out_offsets)
     if HAS_LSE:
-        lse = (m_i + gl.log2(denom)) * _LN2
+        lse = gl.where(
+            has_kv,
+            (m_i + gl.log2(safe_denom)) * _LN2,
+            -float("inf"),
+        )
         lse_offset = row * LSE_STRIDE_T + q_head * LSE_STRIDE_H
         gl.store(lse_out_ptr + lse_offset, lse)
 
@@ -1229,7 +1246,19 @@ def get_config(*, q: torch.Tensor, k: torch.Tensor) -> LaunchConfig:
     )
 
 
-def _select_long_prefill_splits(*, base_ctas: int, num_kv_tiles: int) -> int:
+def _long_prefill_variant() -> str:
+    variant = os.environ.get(_LONG_PREFILL_VARIANT_ENV, "auto")
+    if variant not in _LONG_PREFILL_VARIANTS:
+        choices = ", ".join(sorted(_LONG_PREFILL_VARIANTS))
+        raise ValueError(
+            f"invalid {_LONG_PREFILL_VARIANT_ENV}={variant!r}; expected one of {choices}"
+        )
+    return variant
+
+
+def _select_long_prefill_splits(
+    *, base_ctas: int, num_kv_tiles: int, variant: str = "auto"
+) -> int:
     """Choose the static long-context partition count for gfx950.
 
     A 32-token KV tile uses little enough LDS for several resident CTAs per CU,
@@ -1238,12 +1267,59 @@ def _select_long_prefill_splits(*, base_ctas: int, num_kv_tiles: int) -> int:
     avoids the long serial walk and persistent-scheduler overhead of the short
     path.  Powers of two keep partitions balanced without overpaying the merge.
     """
+    if variant in ("persistent32", "persistent64"):
+        return 1
+    if variant == "split2":
+        return min(2, num_kv_tiles)
+    if variant == "split4":
+        return min(4, num_kv_tiles)
+    if variant != "auto":
+        choices = ", ".join(sorted(_LONG_PREFILL_VARIANTS))
+        raise ValueError(
+            f"invalid long-prefill variant {variant!r}; expected {choices}"
+        )
+
     target_ctas = _GFX950_CU_COUNT * _LONG_PREFILL_TARGET_WAVES
     required = (target_ctas + base_ctas - 1) // base_ctas
     if required < 2:
         required = 2
     splits = 1 << (required - 1).bit_length()
     return min(splits, _LONG_PREFILL_MAX_SPLITS, num_kv_tiles)
+
+
+def _report_split_nan_debug(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mid_o: torch.Tensor,
+    mid_lse: torch.Tensor,
+    out: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_kv: int,
+) -> None:
+    """Synchronize and report the first non-finite split-prefill stage."""
+    if os.environ.get(_SPLIT_NAN_DEBUG_ENV, "0") != "1":
+        return
+
+    torch.cuda.synchronize(q.device)
+    tensors = (
+        ("q", q),
+        ("k", k),
+        ("v", v),
+        ("mid_o", mid_o),
+        ("mid_lse", mid_lse),
+        ("out", out),
+    )
+    nan_counts = {name: int(torch.isnan(tensor).sum()) for name, tensor in tensors}
+    if any(nan_counts.values()):
+        print(
+            "GFX950 MLA split NaN: "
+            f"device={q.device.index} total_q={q.shape[0]} total_kv={k.shape[0]} "
+            f"max_q={max_seqlen_q} max_kv={max_seqlen_kv} "
+            f"nan_counts={nan_counts}",
+            flush=True,
+        )
 
 
 def gluon_mla_prefill_gfx950(
@@ -1325,18 +1401,20 @@ def gluon_mla_prefill_gfx950(
     # CTAs, each with a long serial KV walk. Partition that walk just enough to
     # fill four waves of the machine, then merge the partial softmax states. Keep
     # short prefill on the allocation-free persistent path.
-    use_split_kv = max_seqlen_kv >= _LONG_PREFILL_MIN_KV_TOKENS
-    if use_split_kv:
+    use_long_prefill_policy = max_seqlen_kv >= _LONG_PREFILL_MIN_KV_TOKENS
+    long_prefill_variant = _long_prefill_variant()
+    if use_long_prefill_policy and long_prefill_variant != "persistent64":
         config = config._replace(block_n=_LONG_PREFILL_BLOCK_N)
 
     blocks_per_request = (max_seqlen_q + config.block_m - 1) // config.block_m
     base_ctas = blocks_per_request * batch_size * config.n_heads
     num_kv_tiles = (max_seqlen_kv + config.block_n - 1) // config.block_n
     num_kv_splits = 1
-    if use_split_kv:
+    if use_long_prefill_policy:
         num_kv_splits = _select_long_prefill_splits(
             base_ctas=base_ctas,
             num_kv_tiles=num_kv_tiles,
+            variant=long_prefill_variant,
         )
 
     if num_kv_splits > 1:
@@ -1398,6 +1476,16 @@ def gluon_mla_prefill_gfx950(
             HEAD_DIM=v_head_dim,
             HAS_LSE=return_lse,
             num_warps=1,
+        )
+        _report_split_nan_debug(
+            q=q,
+            k=k,
+            v=v,
+            mid_o=mid_o,
+            mid_lse=mid_lse,
+            out=out,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
         )
         if return_lse:
             return out, lse

@@ -58,6 +58,40 @@ def test_long_prefill_split_selection(
     )
 
 
+@pytest.mark.parametrize(
+    "variant,num_kv_tiles,expected_splits",
+    [
+        pytest.param("persistent32", 256, 1, id="persistent-block-n-32"),
+        pytest.param("persistent64", 256, 1, id="persistent-block-n-64"),
+        pytest.param("split2", 256, 2, id="forced-two-way-split"),
+        pytest.param("split4", 256, 4, id="forced-four-way-split"),
+        pytest.param("split4", 2, 2, id="forced-split-capped-at-kv-tiles"),
+    ],
+)
+def test_long_prefill_forced_variant_selection(
+    variant: str,
+    num_kv_tiles: int,
+    expected_splits: int,
+) -> None:
+    assert (
+        mla_prefill._select_long_prefill_splits(
+            base_ctas=384,
+            num_kv_tiles=num_kv_tiles,
+            variant=variant,
+        )
+        == expected_splits
+    )
+
+
+def test_long_prefill_rejects_unknown_variant() -> None:
+    with pytest.raises(ValueError, match="invalid long-prefill variant"):
+        mla_prefill._select_long_prefill_splits(
+            base_ctas=384,
+            num_kv_tiles=256,
+            variant="unknown",
+        )
+
+
 def test_small_batch_target_workgroup_defaults_match_measured_winners() -> None:
     assert mla_decode._DEFAULT_SMALL_BATCH_TARGET_WORKGROUPS == {
         1: 256,
