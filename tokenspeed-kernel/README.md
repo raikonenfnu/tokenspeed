@@ -132,6 +132,28 @@ iteration.
   `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`), then merge the
   traces with `tokenspeed merge-traces`.
 
+#### Kimi-K3 NoPE-MLA benchmark
+
+The Kimi-K3-specific standalone benchmark replays the full-attention kernel
+shapes used by one TP=8 rank on MI355X. It covers 8K chunked prefill and
+absorbed decode at the 4K, 50K, and 131K context lengths used by the serving
+benchmarks:
+
+```bash
+python -m tokenspeed_kernel.benchmark.kimi_k3_mla --mode all
+```
+
+The default matches the serving attention data path: BF16 model projections;
+FP8 E4M3 Q/K/V and latent KV cache at the kernel boundary; BF16 attention
+output; and FP32 log-sum-exp when requested. It uses 12 local heads and the
+Gluon solution. To model target verification for an EAGLE3 configuration with
+four draft tokens, pass `--speculative-tokens 5`. Use `--kernel NAME` to time
+an exact registered implementation and `--json PATH` to retain structured
+results. The reported 24-layer value is a serial kernel-only estimate; it does
+not include projections, the output gate, collectives, KDA layers, scheduler
+time, or inter-layer overlap. For long prefill, each row represents the final
+scheduler chunk rather than the sum of every chunk in the prompt.
+
 ### Plugins
 
 `python -m tokenspeed_kernel.plugins` lists discovered out-of-tree backends.
