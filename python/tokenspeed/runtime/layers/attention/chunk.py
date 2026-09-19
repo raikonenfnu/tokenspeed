@@ -198,3 +198,40 @@ def build_chunked_prefill_metadata_arrays(
         chunks.cum_seq_lens,
         max_chunk_len_per_loop,
     )
+
+
+def build_full_prefill_metadata_arrays(
+    seq_lens,
+    seq_lens_cpu,
+    page_table,
+    page_size,
+):
+    """Resolve the full KV history when it fits in one materialization pass.
+
+    A single full-history pass lets MLA attend over the cached prefix and the
+    current extend together.  Besides removing one attention launch, it avoids
+    writing and reducing an intermediate softmax state.  Keep the existing
+    prefix-replay plan as the fallback when the configured materialization
+    budget cannot hold every request's full sequence.
+    """
+    batch_size = len(seq_lens_cpu)
+    if batch_size == 0:
+        return None
+
+    chunk_len = get_max_chunk_capacity() // batch_size
+    if int(seq_lens_cpu.max().item()) > chunk_len:
+        return None
+
+    chunks, chunk_kv_indices_list, chunks_cpu = get_chunks_paged(
+        seq_lens,
+        seq_lens_cpu,
+        page_table,
+        page_size,
+    )
+    assert chunks.starts.shape[0] == 1
+    return (
+        chunk_kv_indices_list[0],
+        chunks.len_in_chunk[0],
+        chunks.cum_seq_lens[0],
+        int(chunks_cpu.len_in_chunk[0].max().item()),
+    )

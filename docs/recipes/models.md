@@ -364,6 +364,19 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --port 8000
 ```
 
+For NoPE MLA prefill, TokenSpeed resolves the complete paged history and runs
+one packed causal attention invocation when every request fits the configured
+MLA materialization capacity. This avoids separately expanding the current
+chunk and merging an intermediate prefix softmax result. The capacity is
+`--chunked-prefill-size * --mla-chunk-multiplier`; requests that do not fit
+retain the ordinary bounded-memory chunked path.
+
+When a compatible optional AITER installation is available on gfx950, the
+automatic AMD policy uses its persistent-scheduling FP8 kernel for that
+full-history MLA invocation and its fused FlashKDA kernel for KDA prefill.
+Unsupported shapes, dtypes, platforms, and installations keep the registered
+in-tree implementations. Decode dispatch is unchanged.
+
 To force Gluon attention for an Eagle3 launch, replace the attention option
 above and add the drafter option:
 

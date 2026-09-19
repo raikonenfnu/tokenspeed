@@ -870,6 +870,7 @@ import tokenspeed_kernel.ops.attention.kda.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.kda.aiter  # noqa: E402,F401
 
 # isort: on
 
