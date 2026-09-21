@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="760" viewBox="0 0 1500 760" role="img" aria-labelledby="title desc">
+  <title id="title">Kimi-K3 50K/500 TTFT, TPOT, and total latency before and after one-pass Gluon MLA prefill</title>
+  <desc id="desc">Three grouped bar charts compare baseline and optimized latency at concurrency 1, 2, 4, 8, and 16. Lower values are better.</desc>
+  <style>
+    .title { font: 700 30px sans-serif; fill: #0f172a; }
+    .subtitle { font: 17px sans-serif; fill: #475569; }
+    .panel-title { font: 700 21px sans-serif; fill: #0f172a; }
+    .axis { font: 14px sans-serif; fill: #64748b; }
+    .x-label { font: 600 15px sans-serif; fill: #334155; }
+    .value-before { font: 600 11px sans-serif; fill: #475569; }
+    .value-after { font: 600 11px sans-serif; fill: #047857; }
+    .grid { stroke: #e2e8f0; stroke-width: 1; }
+    .before { fill: #64748b; }
+    .after { fill: #10b981; }
+  </style>
+
+  <rect width="1500" height="760" rx="18" fill="#ffffff"/>
+  <text class="title" x="750" y="52" text-anchor="middle">Kimi-K3 50K/500 latency: before vs. after</text>
+  <text class="subtitle" x="750" y="84" text-anchor="middle">8× MI350X (gfx950) · TP8/EP1 · lower is better</text>
+
+  <rect class="before" x="558" y="105" width="20" height="20" rx="3"/>
+  <text class="subtitle" x="588" y="121">Before (main cae0f292)</text>
+  <rect class="after" x="797" y="105" width="20" height="20" rx="3"/>
+  <text class="subtitle" x="827" y="121">After (e3185b83)</text>
+
+  <!-- TTFT panel -->
+  <rect x="55" y="150" width="430" height="480" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text class="panel-title" x="270" y="181" text-anchor="middle">Time to first token (seconds)</text>
+  <g class="grid">
+    <line x1="105" y1="550" x2="465" y2="550"/><line x1="105" y1="480" x2="465" y2="480"/>
+    <line x1="105" y1="410" x2="465" y2="410"/><line x1="105" y1="340" x2="465" y2="340"/>
+    <line x1="105" y1="270" x2="465" y2="270"/><line x1="105" y1="200" x2="465" y2="200"/>
+  </g>
+  <g class="axis" text-anchor="end">
+    <text x="96" y="555">0</text><text x="96" y="485">10</text><text x="96" y="415">20</text>
+    <text x="96" y="345">30</text><text x="96" y="275">40</text><text x="96" y="205">50</text>
+  </g>
+  <g class="before">
+    <rect x="110" y="459.91" width="22" height="90.09" rx="3"/><rect x="182" y="408.67" width="22" height="141.33" rx="3"/>
+    <rect x="254" y="407.69" width="22" height="142.31" rx="3"/><rect x="326" y="241.93" width="22" height="308.07" rx="3"/>
+    <rect x="398" y="315.43" width="22" height="234.57" rx="3"/>
+  </g>
+  <g class="after">
+    <rect x="137" y="492.53" width="22" height="57.47" rx="3"/><rect x="209" y="495.12" width="22" height="54.88" rx="3"/>
+    <rect x="281" y="493.30" width="22" height="56.70" rx="3"/><rect x="353" y="430.51" width="22" height="119.49" rx="3"/>
+    <rect x="425" y="341.26" width="22" height="208.74" rx="3"/>
+  </g>
+  <g class="value-before" text-anchor="middle">
+    <text x="121" y="453">12.87</text><text x="193" y="402">20.19</text><text x="265" y="401">20.33</text>
+    <text x="337" y="235">44.01</text><text x="409" y="309">33.51</text>
+  </g>
+  <g class="value-after" text-anchor="middle">
+    <text x="148" y="486">8.21</text><text x="220" y="489">7.84</text><text x="292" y="487">8.10</text>
+    <text x="364" y="424">17.07</text><text x="436" y="335">29.82</text>
+  </g>
+  <g class="x-label" text-anchor="middle">
+    <text x="134" y="577">C1</text><text x="206" y="577">C2</text><text x="278" y="577">C4</text>
+    <text x="350" y="577">C8</text><text x="422" y="577">C16</text>
+  </g>
+
+  <!-- TPOT panel -->
+  <rect x="535" y="150" width="430" height="480" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text class="panel-title" x="750" y="181" text-anchor="middle">Time per output token (ms)</text>
+  <g class="grid">
+    <line x1="585" y1="550" x2="945" y2="550"/><line x1="585" y1="491.67" x2="945" y2="491.67"/>
+    <line x1="585" y1="433.33" x2="945" y2="433.33"/><line x1="585" y1="375" x2="945" y2="375"/>
+    <line x1="585" y1="316.67" x2="945" y2="316.67"/><line x1="585" y1="258.33" x2="945" y2="258.33"/>
+    <line x1="585" y1="200" x2="945" y2="200"/>
+  </g>
+  <g class="axis" text-anchor="end">
+    <text x="576" y="555">0</text><text x="576" y="497">30</text><text x="576" y="438">60</text>
+    <text x="576" y="380">90</text><text x="576" y="322">120</text><text x="576" y="263">150</text><text x="576" y="205">180</text>
+  </g>
+  <g class="before">
+    <rect x="590" y="498.51" width="22" height="51.49" rx="3"/><rect x="662" y="491.14" width="22" height="58.86" rx="3"/>
+    <rect x="734" y="454.64" width="22" height="95.36" rx="3"/><rect x="806" y="394.13" width="22" height="155.87" rx="3"/>
+    <rect x="878" y="227.42" width="22" height="322.58" rx="3"/>
+  </g>
+  <g class="after">
+    <rect x="617" y="511.58" width="22" height="38.42" rx="3"/><rect x="689" y="491.02" width="22" height="58.98" rx="3"/>
+    <rect x="761" y="458.81" width="22" height="91.19" rx="3"/><rect x="833" y="419.72" width="22" height="130.28" rx="3"/>
+    <rect x="905" y="269.13" width="22" height="280.87" rx="3"/>
+  </g>
+  <g class="value-before" text-anchor="middle">
+    <text x="601" y="492">26.48</text><text x="673" y="485">30.27</text><text x="745" y="448">49.04</text>
+    <text x="817" y="388">80.16</text><text x="889" y="221">165.90</text>
+  </g>
+  <g class="value-after" text-anchor="middle">
+    <text x="628" y="505">19.76</text><text x="700" y="485">30.33</text><text x="772" y="452">46.90</text>
+    <text x="844" y="413">67.00</text><text x="916" y="263">144.45</text>
+  </g>
+  <g class="x-label" text-anchor="middle">
+    <text x="614" y="577">C1</text><text x="686" y="577">C2</text><text x="758" y="577">C4</text>
+    <text x="830" y="577">C8</text><text x="902" y="577">C16</text>
+  </g>
+
+  <!-- Total latency panel -->
+  <rect x="1015" y="150" width="430" height="480" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text class="panel-title" x="1230" y="181" text-anchor="middle">Total request latency (seconds)</text>
+  <g class="grid">
+    <line x1="1065" y1="550" x2="1425" y2="550"/><line x1="1065" y1="491.67" x2="1425" y2="491.67"/>
+    <line x1="1065" y1="433.33" x2="1425" y2="433.33"/><line x1="1065" y1="375" x2="1425" y2="375"/>
+    <line x1="1065" y1="316.67" x2="1425" y2="316.67"/><line x1="1065" y1="258.33" x2="1425" y2="258.33"/>
+    <line x1="1065" y1="200" x2="1425" y2="200"/>
+  </g>
+  <g class="axis" text-anchor="end">
+    <text x="1056" y="555">0</text><text x="1056" y="497">20</text><text x="1056" y="438">40</text>
+    <text x="1056" y="380">60</text><text x="1056" y="322">80</text><text x="1056" y="263">100</text><text x="1056" y="205">120</text>
+  </g>
+  <g class="before">
+    <rect x="1070" y="473.93" width="22" height="76.07" rx="3"/><rect x="1142" y="447.07" width="22" height="102.93" rx="3"/>
+    <rect x="1214" y="419.33" width="22" height="130.67" rx="3"/><rect x="1286" y="304.97" width="22" height="245.03" rx="3"/>
+    <rect x="1358" y="210.82" width="22" height="339.18" rx="3"/>
+  </g>
+  <g class="after">
+    <rect x="1097" y="497.30" width="22" height="52.70" rx="3"/><rect x="1169" y="483.00" width="22" height="67.00" rx="3"/>
+    <rect x="1241" y="458.12" width="22" height="91.88" rx="3"/><rect x="1313" y="402.71" width="22" height="147.29" rx="3"/>
+    <rect x="1385" y="252.79" width="22" height="297.21" rx="3"/>
+  </g>
+  <g class="value-before" text-anchor="middle">
+    <text x="1081" y="467">26.08</text><text x="1153" y="441">35.29</text><text x="1225" y="413">44.80</text>
+    <text x="1297" y="299">84.01</text><text x="1369" y="204">116.29</text>
+  </g>
+  <g class="value-after" text-anchor="middle">
+    <text x="1108" y="491">18.07</text><text x="1180" y="477">22.97</text><text x="1252" y="452">31.50</text>
+    <text x="1324" y="396">50.50</text><text x="1396" y="247">101.90</text>
+  </g>
+  <g class="x-label" text-anchor="middle">
+    <text x="1094" y="577">C1</text><text x="1166" y="577">C2</text><text x="1238" y="577">C4</text>
+    <text x="1310" y="577">C8</text><text x="1382" y="577">C16</text>
+  </g>
+
+  <text class="subtitle" x="750" y="666" text-anchor="middle">Concurrency</text>
+  <text class="axis" x="750" y="704" text-anchor="middle">One excluded warmup wave + one measured wave per concurrency · FP8 KV · EAGLE3 · zero prefix-cache hits</text>
+</svg>
