@@ -375,6 +375,14 @@ above and add the drafter option:
 The explicit policy fails fast when the current GPU, dtype, or attention shape
 has no registered Gluon kernel instead of silently selecting another solution.
 
+For NoPE MLA prefill, TokenSpeed resolves the complete paged history and runs
+one packed bottom-right causal invocation when every request fits the configured
+materialization capacity (`--chunked-prefill-size * --mla-chunk-multiplier`).
+This expands each latent history row once and avoids the separate prefix
+attention plus softmax-state merge. Larger histories retain the bounded-memory
+chunked path. On gfx950, both this MLA invocation and KDA prefill select the
+in-tree Gluon kernels; no AITER installation is required.
+
 On gfx950, the replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
 to the current token count. At TP8/EP8, eligible one-token decode also combines

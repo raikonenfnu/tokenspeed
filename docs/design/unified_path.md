@@ -639,6 +639,16 @@ perceives cache groups. Leaves own their persistent decode buffers
 each refresh; they do not alias router storage. A single-group model is a
 router with one leaf; there is no single-table special case anywhere.
 
+For NoPE MLA prefill, the same leaf metadata may resolve the complete paged KV
+history when every request fits the configured MLA materialization capacity.
+The model writes the current compressed rows through the ordinary cache-owned
+locations, expands each compressed history row once, and invokes the selected
+dense MLA prefill kernel once with bottom-right causal masking. This is a
+materialization policy within the common prefill path, not a separate backend.
+Histories that exceed the capacity keep the bounded prefix-chunk replay and
+softmax-state merge path. RoPE MLA keeps that established path because its
+position-dependent preparation does not share the NoPE contract.
+
 The sanctioned per-leaf residue, all kernel-imposed: `verify_floor` /
 `block_decode_active` (spec verify geometry as a clamp floor),
 `block_decode_expansion` (whether block decode materializes one metadata

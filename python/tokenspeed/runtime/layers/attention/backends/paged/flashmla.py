@@ -42,6 +42,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.base import (
 )
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
+    build_full_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
@@ -88,6 +89,10 @@ class _ChunkedPrefillMetadata:
     chunked_seq_len: torch.Tensor
     cu_chunked_seq_len: torch.Tensor
     max_chunk_len_per_loop: list
+    full_kv_indices: torch.Tensor | None
+    full_seq_lens: torch.Tensor | None
+    cu_full_seq_lens: torch.Tensor | None
+    max_full_seq_len: int
 
 
 def _per_token_slot_table(
@@ -382,6 +387,24 @@ class FlashMLABackend(PagedAttentionBackend):
             page_table[: seq_lens.shape[0]],
             self.kernel_page_size,
         )
+        full_metadata = build_full_prefill_metadata_arrays(
+            seq_lens,
+            extend_prefix_lens_cpu + extend_seq_lens_cpu,
+            page_table[: seq_lens.shape[0]],
+            self.kernel_page_size,
+        )
+        if full_metadata is None:
+            full_kv_indices = None
+            full_seq_lens = None
+            cu_full_seq_lens = None
+            max_full_seq_len = 0
+        else:
+            (
+                full_kv_indices,
+                full_seq_lens,
+                cu_full_seq_lens,
+                max_full_seq_len,
+            ) = full_metadata
         self.chunked_prefill_metadata = _ChunkedPrefillMetadata(
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
@@ -394,6 +417,10 @@ class FlashMLABackend(PagedAttentionBackend):
             chunked_seq_len=chunked_seq_len,
             cu_chunked_seq_len=cu_chunked_seq_len,
             max_chunk_len_per_loop=max_chunk_len_per_loop,
+            full_kv_indices=full_kv_indices,
+            full_seq_lens=full_seq_lens,
+            cu_full_seq_lens=cu_full_seq_lens,
+            max_full_seq_len=max_full_seq_len,
         )
 
     # ------------------------------------------------------------------

@@ -198,3 +198,39 @@ def build_chunked_prefill_metadata_arrays(
         chunks.cum_seq_lens,
         max_chunk_len_per_loop,
     )
+
+
+def build_full_prefill_metadata_arrays(
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
+    """Resolve a batch's complete KV history when one pass can hold it.
+
+    The caller can then expand each compressed MLA row once and execute one
+    bottom-right causal attention launch over prefix plus extend. Histories
+    larger than the configured materialization capacity retain the bounded
+    prefix-replay path.
+    """
+    batch_size = len(seq_lens_cpu)
+    if batch_size == 0:
+        return None
+
+    max_seq_len = int(seq_lens_cpu.max().item())
+    if max_seq_len > get_max_chunk_capacity() // batch_size:
+        return None
+
+    chunks, chunk_kv_indices_list, chunks_cpu = get_chunks_paged(
+        seq_lens,
+        seq_lens_cpu,
+        page_table,
+        page_size,
+    )
+    assert chunks.starts.shape[0] == 1
+    return (
+        chunk_kv_indices_list[0],
+        chunks.len_in_chunk[0],
+        chunks.cum_seq_lens[0],
+        int(chunks_cpu.len_in_chunk[0].max().item()),
+    )
