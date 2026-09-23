@@ -41,8 +41,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
 from tokenspeed.runtime.layers.attention.chunk import (
-    build_chunked_prefill_metadata_arrays,
-    build_full_prefill_metadata_arrays,
+    build_mla_prefill_metadata_arrays,
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
@@ -375,36 +374,29 @@ class FlashMLABackend(PagedAttentionBackend):
         )
         torch.cumsum(extend_seq_lens, dim=0, out=cum_extend_seq_lens[1:])
         max_extend_seq_len = extend_seq_lens_cpu.max().item()
+        prefill_page_table = page_table[: seq_lens.shape[0]]
         (
-            chunked_loop_num,
-            chunk_kv_indices_list,
-            chunked_seq_len,
-            cu_chunked_seq_len,
-            max_chunk_len_per_loop,
-        ) = build_chunked_prefill_metadata_arrays(
-            extend_prefix_lens,
-            extend_prefix_lens_cpu,
-            page_table[: seq_lens.shape[0]],
-            self.kernel_page_size,
-        )
-        full_metadata = build_full_prefill_metadata_arrays(
-            seq_lens,
-            extend_prefix_lens_cpu + extend_seq_lens_cpu,
-            page_table[: seq_lens.shape[0]],
-            self.kernel_page_size,
-        )
-        if full_metadata is None:
-            full_kv_indices = None
-            full_seq_lens = None
-            cu_full_seq_lens = None
-            max_full_seq_len = 0
-        else:
+            (
+                chunked_loop_num,
+                chunk_kv_indices_list,
+                chunked_seq_len,
+                cu_chunked_seq_len,
+                max_chunk_len_per_loop,
+            ),
             (
                 full_kv_indices,
                 full_seq_lens,
                 cu_full_seq_lens,
                 max_full_seq_len,
-            ) = full_metadata
+            ),
+        ) = build_mla_prefill_metadata_arrays(
+            seq_lens=seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            page_table=prefill_page_table,
+            page_size=self.kernel_page_size,
+        )
         self.chunked_prefill_metadata = _ChunkedPrefillMetadata(
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,

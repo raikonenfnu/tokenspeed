@@ -677,6 +677,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _can_use_full_history_prefill(
+        self, *, full_kv_indices: torch.Tensor | None
+    ) -> bool:
+        """Whether this MLA layer can consume the prepared full-history view."""
+        return self.rotary_emb is None and full_kv_indices is not None
+
     def _project_q_latent(
         self,
         hidden_states: torch.Tensor,
@@ -763,13 +769,10 @@ class DeepseekV3AttentionMLA(nn.Module):
             prefill_locs = ctx.attn_backend.write_locations(
                 self.attn_mha, ForwardMode.EXTEND
             )
-            use_full_history = (
-                getattr(cmeta, "full_kv_indices", None) is not None
-                and self.rotary_emb is None
-            )
-            if (
-                getattr(cmeta, "use_absorbed_cached_extend", False)
-                and not use_full_history
+            if getattr(
+                cmeta, "use_absorbed_cached_extend", False
+            ) and not self._can_use_full_history_prefill(
+                full_kv_indices=cmeta.full_kv_indices
             ):
                 self.forward_absorb(
                     positions[:num_prefill_tokens],
@@ -1106,21 +1109,23 @@ class DeepseekV3AttentionMLA(nn.Module):
         ntok = sum(ctx.attn_backend.chunked_prefill_metadata.extend_seq_lens_cpu)
         scrub_padding_tail(ntok, q, latent_cache)
         chunk_meta = ctx.attn_backend.chunked_prefill_metadata
-        if chunk_meta.full_kv_indices is not None and self.rotary_emb is None:
-            q = self.forward_normal_chunked_q_cache_prepare(
+        if self._can_use_full_history_prefill(
+            full_kv_indices=chunk_meta.full_kv_indices
+        ):
+            q = self._prepare_full_history_q_and_cache(
                 q,
                 latent_cache,
                 ctx,
                 out_cache_loc,
             )
-            return self.forward_normal_chunked_full_kv_core(q, ctx, output)
+            return self._forward_full_history_prefill(q, ctx, output)
 
-        q, k, v = self.forward_normal_chunked_kv_prepare(
+        q, k, v = self._prepare_prefix_replay_qkv_and_cache(
             positions, q, latent_cache, ctx, out_cache_loc
         )
-        return self.forward_normal_chunked_kv_core(q, k, v, ctx, output)
+        return self._forward_prefix_replay_prefill(q, k, v, ctx, output)
 
-    def forward_normal_chunked_q_cache_prepare(
+    def _prepare_full_history_q_and_cache(
         self,
         q: torch.Tensor,
         latent_cache: torch.Tensor,
@@ -1168,7 +1173,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         )
         return q
 
-    def forward_normal_chunked_full_kv_core(
+    def _forward_full_history_prefill(
         self,
         q: torch.Tensor,
         ctx: ForwardContext,
@@ -1235,7 +1240,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         )
         return output
 
-    def forward_normal_chunked_kv_prepare(
+    def _prepare_prefix_replay_qkv_and_cache(
         self,
         positions: torch.Tensor,
         q: torch.Tensor,
@@ -1324,7 +1329,7 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         return q, k, v
 
-    def forward_normal_chunked_kv_core(
+    def _forward_prefix_replay_prefill(
         self,
         q: torch.Tensor,
         k: torch.Tensor,

@@ -641,6 +641,8 @@ router with one leaf; there is no single-table special case anywhere.
 
 For NoPE MLA prefill, the same leaf metadata may resolve the complete paged KV
 history when every request fits the configured MLA materialization capacity.
+One shared MLA prefill builder constructs both the bounded prefix-replay arrays
+and these optional full-history arrays for every paged MLA leaf.
 The model writes the current compressed rows through the ordinary cache-owned
 locations, expands each compressed history row once, and invokes the selected
 dense MLA prefill kernel once with bottom-right causal masking. This is a
