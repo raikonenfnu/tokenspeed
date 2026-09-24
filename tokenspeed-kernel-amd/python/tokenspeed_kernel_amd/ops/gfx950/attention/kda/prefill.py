@@ -63,6 +63,9 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 _CHUNK_SIZE = 64
 _SUBCHUNK_SIZE = 16
 _FUSED_PREPROCESS_WARPS = 4
+# Fill the 16-row MFMA output tile. Smaller blocks duplicate key/state work and
+# leave half of each instruction idle; larger blocks lose scan parallelism.
+_SCAN_OUTPUT_BLOCK = 16
 cdna4 = gl.amd.cdna4
 
 
@@ -1017,7 +1020,7 @@ def launch_gluon_kda_paged_prefill_gfx950(
     output = torch.empty_like(v)
     final_state = torch.empty_like(initial_state)
     initial_state_contiguous = initial_state.contiguous()
-    scan_output_block = 8
+    scan_output_block = _SCAN_OUTPUT_BLOCK
     _launch_producer(
         num_chunks=num_chunks,
         heads=heads,
