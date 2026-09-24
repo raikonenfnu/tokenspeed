@@ -241,6 +241,12 @@ private:
         bool NoPrefillProgress() const { return !pushed_prefill && remote_prefill.empty(); }
     };
 
+    enum class DecodePhase {
+        kFirst,
+        kSteady,
+        kAll,
+    };
+
     // Budget/flag accounting for one operation entering the model batch.
     // Work handed to the transfer peer takes neither budget nor a batch
     // slot, so it bypasses this (but still marks the request scheduled).
@@ -304,7 +310,8 @@ private:
                         std::vector<WriteBackOperation>& write_back_operations);
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   Request* readmission, std::int32_t decode_reserve);
-    void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
+    void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                             DecodePhase phase);
 
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;

@@ -351,6 +351,37 @@ class TestPrefillFirst:
         assert plan.forward[0].num_extends() > 0
         assert plan.forward[0].request_ids == ["r1"]
 
+    def test_first_decode_handoff_precedes_new_prefill(self):
+        """A completed prompt enters generation before another prompt starts."""
+        s = Scheduler(make_config(max_scheduled_tokens=512))
+
+        submit(s, "r0", list(range(4)))
+        s.next_execution_plan()  # r0 -> PrefillDone
+        submit(s, "r1", list(range(4, 8)))
+
+        handoff = s.next_execution_plan()
+        assert handoff.forward[0].request_ids == ["r0"]
+        assert handoff.forward[0].num_extends() == 0
+        assert s.waiting_size() == 1
+
+        prefill = s.next_execution_plan()
+        assert prefill.forward[0].request_ids == ["r1"]
+        assert prefill.forward[0].num_extends() == 1
+
+    def test_first_decode_handoff_is_batched(self):
+        """All ready first decodes share one handoff round."""
+        s = Scheduler(make_config(max_scheduled_tokens=512, max_batch_size=8))
+
+        submit(s, "r0", list(range(4)))
+        submit(s, "r1", list(range(4, 8)))
+        s.next_execution_plan()  # r0 and r1 -> PrefillDone
+        submit(s, "r2", list(range(8, 12)))
+
+        handoff = s.next_execution_plan()
+        assert handoff.forward[0].request_ids == ["r0", "r1"]
+        assert handoff.forward[0].num_extends() == 0
+        assert s.waiting_size() == 1
+
     def test_mixed_prefill_decode_can_schedule_decode_with_new_prefill(self):
         cfg = make_config(max_scheduled_tokens=512, max_batch_size=8)
         cfg.enable_mixed_prefill_decode = True

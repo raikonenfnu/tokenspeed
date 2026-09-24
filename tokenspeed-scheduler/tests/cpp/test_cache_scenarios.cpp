@@ -2225,28 +2225,36 @@ protected:
         SendForwardDone("a", {42});  // 7 tokens
         SendForwardDone("b");        // b's first chunk is intermediate: KV only
 
-        // "b"'s completing chunk; "a" (PrefillDone) waits behind the prefill.
+        // "a" completed its prompt in the previous round, so its first
+        // decode handoff runs before more prefill work.
         ExecutionPlan p3 = PlanOnce();
         const ForwardBatch* op3 = FindForwardBatch(p3);
         ASSERT_NE(op3, nullptr);
         ASSERT_EQ(op3->request_ids.size(), 1u);
-        ASSERT_EQ(op3->request_ids.at(0), "b");
-        SendForwardDone("b", {142});  // 5 tokens
+        ASSERT_EQ(op3->request_ids.at(0), "a");
+        SendForwardDone("a", {43});  // 8 tokens = a's capacity
 
-        // Both decode transitions consume their reservations: free 0.
+        // Steady decode still yields to "b"'s completing prefill chunk.
         ExecutionPlan p4 = PlanOnce();
         const ForwardBatch* op4 = FindForwardBatch(p4);
         ASSERT_NE(op4, nullptr);
-        ASSERT_EQ(op4->request_ids.size(), 2u);
-        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
-        SendForwardDone("a", {43});   // 8 tokens = a's capacity
-        SendForwardDone("b", {143});  // 6 tokens = b's capacity
+        ASSERT_EQ(op4->request_ids, std::vector<std::string>{"b"});
+        SendForwardDone("b", {142});  // 5 tokens
 
-        // Tail-page decodes (0 fresh blocks).
+        // "b" now gets its first decode handoff. Both reservations have
+        // been consumed after this round: free 0.
         ExecutionPlan p5 = PlanOnce();
         const ForwardBatch* op5 = FindForwardBatch(p5);
         ASSERT_NE(op5, nullptr);
-        ASSERT_EQ(op5->request_ids.size(), 2u);
+        ASSERT_EQ(op5->request_ids, std::vector<std::string>{"b"});
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+        SendForwardDone("b", {143});  // 6 tokens = b's capacity
+
+        // Tail-page decodes (0 fresh blocks).
+        ExecutionPlan p6 = PlanOnce();
+        const ForwardBatch* op6 = FindForwardBatch(p6);
+        ASSERT_NE(op6, nullptr);
+        ASSERT_EQ(op6->request_ids.size(), 2u);
         SendForwardDone("a", {44});   // 9 tokens: past capacity
         SendForwardDone("b", {144});  // 7 tokens: past capacity
 
@@ -2345,6 +2353,10 @@ TEST_F(PrefillHeadOfLineSuite, RetractingAnIncompletePrefillPublishesOnlyCompute
     ExecutionPlan p1 = PlanOnce();
     ASSERT_EQ(FindForwardBatch(p1)->request_ids, std::vector<std::string>{"done"});
     SendForwardDone("done", {42});
+
+    ExecutionPlan handoff = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(handoff)->request_ids, std::vector<std::string>{"done"});
+    SendForwardDone("done", {43});
 
     Submit(MakeRequestSpec("half", /*num_pages=*/8, /*start=*/101));
     ExecutionPlan p2 = PlanOnce();
@@ -2676,6 +2688,10 @@ TEST_F(PrefillHeadOfLineSuite, AnIncompletePrefillGivesWayBeforeACompletedOne) {
     ASSERT_EQ(FindForwardBatch(p1)->request_ids, std::vector<std::string>{"done"});
     SendForwardDone("done", {42});
 
+    ExecutionPlan handoff = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(handoff)->request_ids, std::vector<std::string>{"done"});
+    SendForwardDone("done", {43});
+
     Submit(MakeRequestSpec("half", /*num_pages=*/8, /*start=*/101));
     ExecutionPlan p2 = PlanOnce();
     ASSERT_EQ(FindForwardBatch(p2)->request_ids, std::vector<std::string>{"half"});
@@ -2698,6 +2714,10 @@ TEST_F(PrefillHeadOfLineSuite, AnIncompletePrefillIsNotRetractedWhileItsChunkIsI
     ExecutionPlan p1 = PlanOnce();
     ASSERT_EQ(FindForwardBatch(p1)->request_ids, std::vector<std::string>{"done"});
     SendForwardDone("done", {42});
+
+    ExecutionPlan handoff = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(handoff)->request_ids, std::vector<std::string>{"done"});
+    SendForwardDone("done", {43});
 
     Submit(MakeRequestSpec("half", /*num_pages=*/8, /*start=*/101));
     ExecutionPlan p2 = PlanOnce();
@@ -2724,6 +2744,10 @@ TEST_F(PrefillHeadOfLineSuite, BlockedLaterChunkDoesNotStartSubmittedRequest) {
     ExecutionPlan holder_prefill = PlanOnce();
     ASSERT_EQ(FindForwardBatch(holder_prefill)->request_ids, std::vector<std::string>{"holder"});
     SendForwardDone("holder", {42});
+
+    ExecutionPlan holder_handoff = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(holder_handoff)->request_ids, std::vector<std::string>{"holder"});
+    SendForwardDone("holder", {43});
 
     Submit(MakeRequestSpec("active", /*num_pages=*/8, /*start=*/101));
     ExecutionPlan first_chunk = PlanOnce();

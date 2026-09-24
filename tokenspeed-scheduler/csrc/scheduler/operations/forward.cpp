@@ -884,18 +884,27 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
     }
 }
 
-// The decode batch shared by the D and fused grammars: every PrefillDone
-// (its first decode) and Decoding candidate. The budget guard protects the
-// mamba state reserve of a prefill scheduled beside them in mixed mode; on
-// the D role decodes consume no budget, so it never binds there.
-void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build,
-                                    std::span<Request* const> candidates) {
+// Build one requested decode phase. PrefillDone is the handoff between prompt
+// processing and generation; Decoding is steady-state generation. Keeping the
+// distinction here lets a role state its service policy without duplicating
+// decode admission or construction.
+//
+// The budget guard protects the mamba state reserve of a prefill scheduled
+// beside decodes in mixed mode; on the D role decodes consume no budget, so it
+// never binds there.
+void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                                    DecodePhase phase) {
     for (Request* request : candidates) {
         if (build.Full(config_.max_batch_size) ||
             build.token_budget < build.state_prefill_reserve + config_.decode_input_tokens) {
             return;
         }
-        if ((!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) || build.Scheduled(*request)) {
+        const bool first_decode = request->Is<fsm::PrefillDone>();
+        const bool steady_decode = request->Is<fsm::Decoding>();
+        const bool selected = (phase == DecodePhase::kAll && (first_decode || steady_decode)) ||
+                              (phase == DecodePhase::kFirst && first_decode) ||
+                              (phase == DecodePhase::kSteady && steady_decode);
+        if (!selected || build.Scheduled(*request)) {
             continue;
         }
         feedback.admission_failed = false;
@@ -973,7 +982,7 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 
     // Phase 2: the decode batch. Completed prefills' first decodes go ahead
     // of the running ones; neither consumes token budget on this role.
-    scheduleDecodeBatch(feedback, build, candidates);
+    scheduleDecodeBatch(feedback, build, candidates, DecodePhase::kAll);
 
     // Phase 3: at most one remote admission -- the whole prompt reserves at
     // once, so admitting a queue's worth in one round would drain the pool
@@ -1017,13 +1026,25 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
                 return request->Is<fsm::Prefilling>() || admitsLikeNewPrompt(*request);
             });
         build.state_prefill_reserve = has_local_prefill ? MinPrefillChunkTokens(coordinator_) : 0;
-        scheduleDecodeBatch(feedback, build, candidates);
+        scheduleDecodeBatch(feedback, build, candidates, DecodePhase::kAll);
+    } else {
+        // A completed prompt already paid for its first decode when its final
+        // chunk was admitted. Hand that prompt into generation before starting
+        // another prompt chunk. This is a pure decode round: non-mixed mode
+        // still never combines prefill and decode in one model forward.
+        // Steady-state decodes remain behind prefill so long generations do not
+        // starve queued prompts.
+        scheduleDecodeBatch(feedback, build, candidates, DecodePhase::kFirst);
+        if (build.pushed_decode || feedback.capacity_blocker != nullptr) {
+            maybeRetractForCapacity(feedback, build, candidates, write_back_operations);
+            return;
+        }
     }
 
     scheduleLocalPrefillWork(feedback, build, candidates, readmission, config_.decode_input_tokens);
 
     if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill) {
-        scheduleDecodeBatch(feedback, build, candidates);
+        scheduleDecodeBatch(feedback, build, candidates, DecodePhase::kSteady);
     }
 
     maybeRetractForCapacity(feedback, build, candidates, write_back_operations);

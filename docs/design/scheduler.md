@@ -529,9 +529,13 @@ decode batch leaves `state_prefill_reserve` (one state-checkpoint page of
 budget) untouched when a mamba prefill is pending, since that prefill cannot
 advance in sub-page chunks.
 
-**Phases, non-mixed:** the prefill phases run first and alone; decodes get
-the round only when no prefill scheduled. No state reserve is needed —
-scheduling order is the capacity priority.
+**Phases, non-mixed:** ready first decodes (`PrefillDone`) run first as a pure,
+batched handoff round. The prefill phases then run first and alone; steady-state
+decodes (`Decoding`) get the round only when no prefill scheduled. This keeps a
+completed prompt from waiting behind the rest of a prefill cohort before it can
+stream its first result, while preserving prefill priority over ongoing
+generations. Prefill and decode never share a model forward. No state reserve
+is needed — scheduling order is the capacity priority.
 
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. Whether the victim's KV is stored depends on the host cache:

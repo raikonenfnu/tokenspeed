@@ -185,9 +185,8 @@ class TestReqPoolIndices:
         r1_idx = new_plan.forward[0].request_pool_indices[0]
 
         submit(s, "r2", list(range(4)))
-        new_plan = (
-            s.next_execution_plan()
-        )  # r2: Submitted → PrefillDone (r1 also schedules)
+        s.next_execution_plan()  # r1: PrefillDone -> Decoding handoff
+        new_plan = s.next_execution_plan()  # r2: Submitted -> PrefillDone
         r2_idx = new_plan.forward[0].request_pool_indices[0]
 
         assert r0_idx == 1
