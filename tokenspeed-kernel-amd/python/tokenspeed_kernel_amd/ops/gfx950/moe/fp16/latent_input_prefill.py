@@ -46,7 +46,7 @@ _NUM_WARPS = 8
 _WARPS_M = 2
 _WARPS_N = 4
 _NUM_XCDS = 8
-_GROUP_SIZE_M = 4
+_GROUP_SIZE_M = 8
 
 # SiTU epilogue tile. BLOCK_N divides the 768-wide shared output, so no lane is
 # masked along the columns, and the layout gives each lane a dwordx4 of them.
