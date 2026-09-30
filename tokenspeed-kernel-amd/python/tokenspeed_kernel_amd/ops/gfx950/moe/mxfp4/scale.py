@@ -21,10 +21,11 @@
 
 """Package-prefill activation-scale gather for the gfx950 MXFP4-weight package.
 
-The MXFP4 quantizer emits CDNA4-swizzled, token-order activation scales, but the
-package stage kernels need those same bytes in sorted-route row order. This
-module copies directly between the two CDNA4 layouts (token order -> sorted
-route order) with no intermediate unswizzle.
+For this consumer the MXFP4 quantizer emits row-major, token-order activation
+scales, but the package stage kernels need them CDNA4-swizzled in sorted-route
+row order. This module gathers whole token rows into sorted-route order and
+applies the swizzle to each 32-row block in registers, so no separate swizzle
+pass runs.
 
 It is package-specific glue -- it understands the CDNA4 scale layout and the
 sorted-route packing produced by :mod:`moe_sorting` -- so it lives next to the
