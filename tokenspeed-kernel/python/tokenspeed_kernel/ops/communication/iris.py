@@ -221,7 +221,13 @@ class _StagedTwoStageAllReduceKernelTuning:
     words_per_lane: int
 
     def __post_init__(self) -> None:
-        if self.world_size <= 1 or self.numel <= 0 or self.words_per_lane <= 0:
+        # BLOCK_WORDS scales with words_per_lane and must stay a power of two.
+        if (
+            self.world_size <= 1
+            or self.numel <= 0
+            or self.words_per_lane <= 0
+            or self.words_per_lane & (self.words_per_lane - 1)
+        ):
             raise ValueError("invalid staged two-stage Iris kernel tuning")
 
 
@@ -244,6 +250,7 @@ class _TwoStageAllReduceKernelConfig:
             )
             or self.max_programs <= 0
             or self.words_per_lane <= 0
+            or self.words_per_lane & (self.words_per_lane - 1)
         ):
             raise ValueError("invalid two-stage Iris kernel configuration")
         tuning_keys = tuple(
@@ -275,9 +282,11 @@ class _TwoStageAllReduceKernelConfig:
             return 0
         return triton.cdiv(max_numel, world_size)
 
-    def block_words(self, world_size: int, subgroup_size: int) -> int:
+    def block_words(
+        self, world_size: int, subgroup_size: int, words_per_lane: int
+    ) -> int:
         assert self.supports_world_size(world_size)
-        return self.num_subgroups * subgroup_size * self.words_per_lane // world_size
+        return self.num_subgroups * subgroup_size * words_per_lane // world_size
 
     def staged_words_per_lane(
         self,
@@ -1367,11 +1376,10 @@ class IrisAllReduce(object):
             numel=numel,
             is_cdna4=_platform.is_cdna4,
         )
-        block_words = (
-            kernel_config.num_subgroups
-            * self._kernel_config.subgroup_size
-            * words_per_lane
-            // self.world_size
+        block_words = kernel_config.block_words(
+            world_size=self.world_size,
+            subgroup_size=self._kernel_config.subgroup_size,
+            words_per_lane=words_per_lane,
         )
         num_tiles = triton.cdiv(partition_words, block_words)
         num_programs = min(num_tiles, kernel_config.max_programs)
@@ -1474,6 +1482,7 @@ class IrisAllReduce(object):
             block_words = two_stage_config.block_words(
                 world_size=self.world_size,
                 subgroup_size=self._kernel_config.subgroup_size,
+                words_per_lane=two_stage_config.words_per_lane,
             )
             num_tiles = triton.cdiv(partition_words, block_words)
             num_programs = min(num_tiles, two_stage_config.max_programs)

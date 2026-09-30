@@ -42,10 +42,12 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 
 # Kimi-K3 EAGLE3 verification reaches 64 x 7168 BF16 elements at concurrency
-# 16 (896 KiB). Iris is faster than RCCL for that node-local TP8 payload on
-# gfx950, so keep the ordinary window large enough to admit it.
+# 16 (896 KiB). On CDNA4 the staged two-stage Iris kernel is faster than RCCL
+# for that node-local TP8 payload, so its ordinary window admits it; other AMD
+# parts keep the measured 512 KiB window.
 _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
-_DEFAULT_ALL_REDUCE_MAX_BYTES = 1024 * 1024
+_DEFAULT_ALL_REDUCE_MAX_BYTES = 512 * 1024
+_CDNA4_ALL_REDUCE_MAX_BYTES = 1024 * 1024
 
 
 class TritonAllReduceBackend(CommBackend):
@@ -57,8 +59,13 @@ class TritonAllReduceBackend(CommBackend):
         self._fallback = fallback
         self._instances = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
+        all_reduce_max_bytes = (
+            _CDNA4_ALL_REDUCE_MAX_BYTES
+            if current_platform().is_cdna4
+            else _DEFAULT_ALL_REDUCE_MAX_BYTES
+        )
         self._max_numel = (
-            min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
+            min(producer_direct_max_bytes, all_reduce_max_bytes)
             // torch.empty((), dtype=torch.bfloat16).element_size()
         )
 

@@ -125,18 +125,22 @@ def test_triton_collection_fallback_reduces_each_tensor(monkeypatch):
     )
 
 
-def test_triton_ordinary_all_reduce_keeps_1_mib_limit(monkeypatch):
+@pytest.mark.parametrize(
+    ("is_cdna4", "max_rows"),
+    [(True, 73), (False, 36)],  # 1 MiB and 512 KiB of 7168-wide BF16 rows.
+)
+def test_triton_ordinary_all_reduce_window(monkeypatch, is_cdna4, max_rows):
+    monkeypatch.setattr(
+        triton_allreduce_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_amd=True, is_cdna4=is_cdna4),
+    )
     backend = TritonAllReduceBackend(Mock(), producer_direct_max_bytes=1024 * 1024)
     group = tuple(range(8))
     tensor = Mock(
         is_cuda=True,
         is_contiguous=Mock(return_value=True),
         dtype=torch.bfloat16,
-    )
-    monkeypatch.setattr(
-        triton_allreduce_module,
-        "current_platform",
-        lambda: SimpleNamespace(is_amd=True),
     )
     monkeypatch.setattr(backend, "_get_or_create", lambda _group: object())
     monkeypatch.setattr(
@@ -145,9 +149,9 @@ def test_triton_ordinary_all_reduce_keeps_1_mib_limit(monkeypatch):
         lambda _state, _tensor, op: True,
     )
 
-    tensor.numel.return_value = 73 * 7168
+    tensor.numel.return_value = max_rows * 7168
     assert backend.can_run(tensor, group)
-    tensor.numel.return_value = 74 * 7168
+    tensor.numel.return_value = (max_rows + 1) * 7168
     assert not backend.can_run(tensor, group)
     assert backend.producer_direct_max_bytes == 1024 * 1024
 
