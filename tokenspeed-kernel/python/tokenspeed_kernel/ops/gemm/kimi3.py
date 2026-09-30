@@ -42,6 +42,8 @@ KIMI3_LATENT_SIZE = 3584
 KIMI3_QKVFAB_SIZE = 6288
 KIMI3_ROUTER_SIZE = 896
 _KIMI3_QKVFAB_GFX950_MAIN_SIZE = 6144
+# Below this the vendor GEMM is as fast or faster (measured on gfx950).
+_KIMI3_QKVFAB_GFX950_MIN_M = 8192
 
 KIMI3_SHARED_LOCAL_SIZE = 768
 
@@ -85,7 +87,12 @@ def _use_gluon_largem(m: int, k: int, n: int) -> bool:
 
 
 def _use_gluon_qkvfab_prefill_gfx950(m: int, k: int, n: int) -> bool:
-    return (m, k, n) == (8192, KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE)
+    # The large-M kernel takes whole 256-row tiles.
+    return (
+        (k, n) == (KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE)
+        and m >= _KIMI3_QKVFAB_GFX950_MIN_M
+        and m % 256 == 0
+    )
 
 
 def _try_gluon_largem_gfx1250(
@@ -1279,7 +1286,8 @@ def kimi3_qkvfab_projection(
         ):
             raise ValueError(
                 "Kimi K3 gfx950 split QKVFAB projection requires contiguous "
-                "BF16 A [8192,7168] and weight [6288,7168]"
+                "BF16 A [M,7168] with M >= 8192 and a multiple of 256, and "
+                "weight [6288,7168]"
             )
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
             launch_gluon_mm_a16w16_prefill_gfx950,
@@ -1298,7 +1306,9 @@ def kimi3_qkvfab_projection(
         )
         if main is None:
             raise RuntimeError("gfx950 rejected the aligned QKVFAB projection")
-        torch.mm(hidden_states, weight[split:].T, out=out[:, split:])
+        # The vendor GEMM writing straight into the strided column slice
+        # faults for some M (e.g. 1024-2048 on ROCm 7.2), so stage the tail.
+        out[:, split:].copy_(torch.mm(hidden_states, weight[split:].T))
         return out
     if solution == "gluon_wmma_gfx1250":
         if not (
