@@ -8,6 +8,7 @@ import torch
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     _use_gluon_largem,
     _use_gluon_mediumm,
+    _use_gluon_qkvfab_prefill_gfx950,
     _use_gluon_smallm,
 )
 from tokenspeed_kernel.ops.moe.sigmoid_topk import (
@@ -102,6 +103,18 @@ def test_kimi3_latent_projection_smallm_dispatch(
     m: int, k: int, n: int, expected: bool
 ) -> None:
     assert _use_gluon_smallm(m, k, n) is expected
+
+
+@pytest.mark.parametrize(
+    "m,k,n,expected",
+    [
+        (8192, 7168, 6288, True),
+        (8191, 7168, 6288, False),
+        (8192, 7168, 6400, False),
+    ],
+)
+def test_kimi3_qkvfab_prefill_dispatch(m: int, k: int, n: int, expected: bool) -> None:
+    assert _use_gluon_qkvfab_prefill_gfx950(m, k, n) is expected
 
 
 @pytest.mark.parametrize("input_size,output_size", [(7168, 3584), (3584, 7168)])
@@ -217,6 +230,24 @@ def test_kimi3_qkvfab_projection_matches_torch_and_captures() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [8192, 16384])
+def test_kimi3_qkvfab_prefill_split_matches_fp32(num_tokens: int) -> None:
+    torch.manual_seed(43)
+    hidden_states = torch.randn(num_tokens, 7168, device="cuda", dtype=torch.bfloat16)
+    # Unit-variance outputs, so the tolerance is the BF16 output rounding.
+    weight = (torch.randn(6288, 7168, device="cuda") / 7168**0.5).to(torch.bfloat16)
+    expected = hidden_states.float() @ weight.float().T
+
+    actual = tokenspeed_kernel.kimi3_qkvfab_projection(
+        hidden_states, weight, solution="gluon_largem_split_gfx950"
+    )
+    auto = tokenspeed_kernel.kimi3_qkvfab_projection(hidden_states, weight)
+
+    torch.testing.assert_close(actual.float(), expected, rtol=2**-8, atol=1e-4)
+    # Automatic dispatch takes the split route for these widths.
+    torch.testing.assert_close(auto, actual, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [0, 1, 2, 4, 8, 33])

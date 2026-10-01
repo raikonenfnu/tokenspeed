@@ -41,6 +41,9 @@ KIMI3_HIDDEN_SIZE = 7168
 KIMI3_LATENT_SIZE = 3584
 KIMI3_QKVFAB_SIZE = 6288
 KIMI3_ROUTER_SIZE = 896
+_KIMI3_QKVFAB_GFX950_MAIN_SIZE = 6144
+# Below this the vendor GEMM is as fast or faster (measured on gfx950).
+_KIMI3_QKVFAB_GFX950_MIN_M = 8192
 
 KIMI3_SHARED_LOCAL_SIZE = 768
 
@@ -81,6 +84,15 @@ def _use_gluon_largem(m: int, k: int, n: int) -> bool:
     else:
         return False
     return m >= min_m and m % 256 == 0
+
+
+def _use_gluon_qkvfab_prefill_gfx950(m: int, k: int, n: int) -> bool:
+    # The large-M kernel takes whole 256-row tiles.
+    return (
+        (k, n) == (KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE)
+        and m >= _KIMI3_QKVFAB_GFX950_MIN_M
+        and m % 256 == 0
+    )
 
 
 def _try_gluon_largem_gfx1250(
@@ -1148,7 +1160,8 @@ def kimi3_qkvfab_projection(
             given the flashinfer blockscale kernel is pinned.
         out: Optional contiguous BF16 output buffer shaped ``[M, N]``.
         solution: ``"auto"`` selects the architecture-specific BF16 route;
-            ``"triton_gemv"``, ``"gluon_wmma_gfx1250"``,
+            ``"triton_gemv"``, ``"gluon_largem_split_gfx950"``,
+            ``"gluon_wmma_gfx1250"``,
             ``"gluon_largem_gfx1250"``, and ``"torch"`` force one.
             (BF16 path only.)
 
@@ -1196,6 +1209,7 @@ def kimi3_qkvfab_projection(
         "auto",
         "decode_gemv",
         "triton_gemv",
+        "gluon_largem_split_gfx950",
         "gluon_wmma_gfx1250",
         "gluon_largem_gfx1250",
         "torch",
@@ -1213,6 +1227,18 @@ def kimi3_qkvfab_projection(
     )
     if solution == "auto":
         if (
+            Platform.get().is_cdna4
+            and hidden_states.is_cuda
+            and weight.is_cuda
+            and _use_gluon_qkvfab_prefill_gfx950(m, input_width, output_width)
+            and hidden_states.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and weight.is_contiguous()
+            and (out is None or out.is_contiguous())
+        ):
+            solution = "gluon_largem_split_gfx950"
+        elif (
             Platform.get().is_cdna5
             and hidden_states.is_cuda
             and weight.is_cuda
@@ -1245,6 +1271,45 @@ def kimi3_qkvfab_projection(
             solution = "decode_gemv"
         else:
             solution = "torch"
+    if solution == "gluon_largem_split_gfx950":
+        if not (
+            Platform.get().is_cdna4
+            and _use_gluon_qkvfab_prefill_gfx950(m, input_width, output_width)
+            and hidden_states.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and hidden_states.is_cuda
+            and weight.is_cuda
+            and hidden_states.device == weight.device
+            and hidden_states.is_contiguous()
+            and weight.is_contiguous()
+            and (out is None or out.is_contiguous())
+        ):
+            raise ValueError(
+                "Kimi K3 gfx950 split QKVFAB projection requires contiguous "
+                "BF16 A [M,7168] with M >= 8192 and a multiple of 256, and "
+                "weight [6288,7168]"
+            )
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+            launch_gluon_mm_a16w16_prefill_gfx950,
+        )
+
+        if out is None:
+            out = hidden_states.new_empty((m, output_width))
+        # Q/K/V/g form a 256-aligned main GEMM; f_a, beta and padding form
+        # the narrow tail. Splitting avoids padding every layer's weight.
+        split = _KIMI3_QKVFAB_GFX950_MAIN_SIZE
+        main = launch_gluon_mm_a16w16_prefill_gfx950(
+            hidden_states,
+            weight[:split],
+            hidden_states.dtype,
+            out=out[:, :split],
+        )
+        if main is None:
+            raise RuntimeError("gfx950 rejected the aligned QKVFAB projection")
+        # The vendor GEMM writing straight into the strided column slice
+        # faults for some M (e.g. 1024-2048 on ROCm 7.2), so stage the tail.
+        out[:, split:].copy_(torch.mm(hidden_states, weight[split:].T))
+        return out
     if solution == "gluon_wmma_gfx1250":
         if not (
             Platform.get().is_cdna5
