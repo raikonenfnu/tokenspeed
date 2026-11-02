@@ -149,7 +149,7 @@ def _worker(rank: int, port: int) -> None:
                 scratch,
                 plan,
                 "ss1",
-                _tail_sums(b, h, alpha, beta).view(torch.int32).to(device),
+                _tail_sums(b, h, alpha, beta).flatten().view(torch.int32).to(device),
                 launch_tag(step, 0),
             )
             route_kernel[(plan.grid,)](
