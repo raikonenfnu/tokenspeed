@@ -44,16 +44,18 @@ as `prepare_qwen4_exp_*` and `qwen4_exp_*_decode`.
 ### Serving
 
 `python/tokenspeed/runtime/models/qwen4_exp_monokernel.py` is the runtime
-seam. The switch `--decode-monokernel` enables it.
+seam. With `--decode-monokernel`, `Qwen4ExpModel` builds its layers from the
+monokernel classes `Qwen4ExpMonokernelLinearDecoderLayer` and
+`Qwen4ExpMonokernelAttentionDecoderLayer`.
 
-- A layer is eligible when it has a sparse MoE with a shared expert, and no
-  attention TP or expert parallelism. The seam decides this once, at load,
-  and logs every other layer with its reasons. Startup fails when no layer
-  of the target model is eligible.
-- The seam packs each eligible layer after the weights load.
-- A forward uses the kernels when it is a decode step of at most 4 rows,
-  padded graph rows included. Each request has one token, or `k + 1` tokens of
-  a target verify with ReplaySSM. Other forwards use the regular path.
+- A layer can be packed when it has a sparse MoE with a shared expert, and
+  no attention TP or expert parallelism. The seam packs every layer once,
+  after the weights load. Startup fails when a layer cannot be packed, and
+  the error names each such layer with its reasons.
+- A layer runs its launch when the forward is a decode step of at most 4
+  rows, padded graph rows included. Each request has one token, or `k + 1`
+  tokens of a target verify with ReplaySSM. Other forwards run the regular
+  layer's code.
 - The MTP draft model's one QSA layer, with its final mixer, uses the same
   kernel for every draft step: the first step as a chain over one request's
   verified rows (a first step of several requests uses the regular path),
